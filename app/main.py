@@ -51,6 +51,8 @@ async def _show_routes():
     for r in app.routes:
         methods = ",".join(getattr(r, "methods", []) or [])
         print(f"ROUTE: {methods:10s} {r.path}")
+
+    print(f"OpenAPI available at /openapi.json")
 async def _dump_openapi():
     schema = get_openapi(
         title=app.title, version=app.version,
