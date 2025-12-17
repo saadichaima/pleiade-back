@@ -63,12 +63,22 @@ class Settings(BaseModel):
     STORAGE_CONTAINER_OUTPUTS: str = os.getenv("STORAGE_CONTAINER_OUTPUTS", "outputs")
     AAD_TENANT_ID: str = os.getenv("AAD_TENANT_ID", "")
     AAD_CLIENT_ID: str = os.getenv("AAD_CLIENT_ID", "")
+    AAD_CLIENT_ID: str = os.getenv("AAD_CLIENT_ID", "")
+    AAD_AUDIENCE: str = os.getenv("AAD_AUDIENCE", "")
+
+
+    
 
     @property
     def AAD_ISSUER(self) -> str:
         if not self.AAD_TENANT_ID:
             return ""
         return f"https://login.microsoftonline.com/{self.AAD_TENANT_ID}/v2.0"
+    @property
+    def AAD_ISSUER_V1(self) -> str:
+     if not self.AAD_TENANT_ID:
+        return ""
+     return f"https://sts.windows.net/{self.AAD_TENANT_ID}/"
 
     @property
     def AAD_JWKS_URL(self) -> str:

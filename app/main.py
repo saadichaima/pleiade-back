@@ -28,14 +28,18 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+           "http://localhost:5173/login",
         "http://127.0.0.1:5173",
         "https://zealous-sea-0b0962f03.3.azurestaticapps.net",
-        "https://pleiade.bci.fr"
+        "https://pleiade.bci.fr",
+        "https://pleiade.bci.fr/login"
 
     ],
     allow_credentials=False,   # important si tu utilises "*"
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Project-Id", "X-Output-Blob-Url"],
+
 )
 
 app.include_router(health.router)
