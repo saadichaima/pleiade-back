@@ -503,8 +503,10 @@ async def generate_docx(
     # Lecture du DOCX final
     with open(out_path, "rb") as f:
         content = f.read()
+    year_suffix = str(info.annee)[-2:]
+
     filename = (
-        f'Dossier_{type_dossier}_{info.projet_name.replace(" ", "_")}.docx'
+        f'{info.projet_name}_{type_dossier}_{year_suffix}_VIA.docx'
     )
 
     # ===== 11) Upload du DOCX généré dans Blob + enregistrement Cosmos outputs =====

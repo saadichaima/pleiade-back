@@ -30,6 +30,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "https://zealous-sea-0b0962f03.3.azurestaticapps.net",
+        "https://pleiade.bci.fr"
 
     ],
     allow_credentials=False,   # important si tu utilises "*"

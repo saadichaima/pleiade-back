@@ -2,45 +2,19 @@
 from docxtpl import DocxTemplate, InlineImage
 from docx.shared import Cm, Pt, RGBColor
 from docx import Document as DocxDocument
-import os, re
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+import os
+import re
 
 DEFAULT_FONT = "Times New Roman"
 
-# On gère aussi les espaces insécables (U+00A0)
 SPACE_RE = re.compile(r"[\s\u00A0]+")
 
 
 def _collapse_spaces(text: str) -> str:
-    """Remplace toutes les séquences d'espaces/tab (y compris NBSP) par un seul espace."""
     if not text:
         return ""
     return SPACE_RE.sub(" ", text).strip()
-
-
-def generate_cir_docx(template_path: str, output_path: str, d: dict):
-    if not os.path.exists(template_path):
-        raise FileNotFoundError(template_path)
-    doc = DocxTemplate(template_path)
-    logo = d["info"].get("logo")
-    if logo:
-        d["info"]["logo"] = InlineImage(doc, logo, width=Cm(4))
-    doc.render({"d": d, "cm": Cm})
-    doc.save(output_path)
-    clean_custom_tags(output_path)
-    format_docx(output_path)
-    return output_path
-
-
-def _add_red(par, text):
-    run = par.add_run(text)
-    run.font.name = DEFAULT_FONT
-    run.font.color.rgb = RGBColor(255, 0, 0)
-
-
-def _add_black(par, text):
-    run = par.add_run(text)
-    run.font.name = DEFAULT_FONT
-    run.font.color.rgb = RGBColor(0, 0, 0)
 
 
 def _apply_markdown_style(par):
@@ -49,7 +23,7 @@ def _apply_markdown_style(par):
     On reconstruit les runs en supprimant les astérisques.
     """
     raw = par.text
-    if "*" not in raw:
+    if not raw or "*" not in raw:
         return
 
     par.clear()
@@ -61,108 +35,89 @@ def _apply_markdown_style(par):
         if i + 1 < n and raw[i] == "*" and raw[i + 1] == "*":
             end = raw.find("**", i + 2)
             if end == -1:
-                # pas de fermeture -> texte normal
-                run = par.add_run(raw[i:])
-                run.font.name = DEFAULT_FONT
+                chunk = raw[i:]
+                if chunk:
+                    r = par.add_run(chunk)
+                    r.font.name = DEFAULT_FONT
                 break
             content = raw[i + 2:end]
             if content:
-                run = par.add_run(content)
-                run.bold = True
-                run.font.name = DEFAULT_FONT
+                r = par.add_run(content)
+                r.bold = True
+                r.font.name = DEFAULT_FONT
             i = end + 2
+
         # italique simple (*...*)
         elif raw[i] == "*":
             end = raw.find("*", i + 1)
             if end == -1:
-                run = par.add_run(raw[i:])
-                run.font.name = DEFAULT_FONT
+                chunk = raw[i:]
+                if chunk:
+                    r = par.add_run(chunk)
+                    r.font.name = DEFAULT_FONT
                 break
             content = raw[i + 1:end]
             if content:
-                run = par.add_run(content)
-                run.italic = True
-                run.font.name = DEFAULT_FONT
+                r = par.add_run(content)
+                r.italic = True
+                r.font.name = DEFAULT_FONT
             i = end + 1
+
         else:
-            # texte normal jusqu’au prochain *
             j = i
             while j < n and raw[j] != "*":
                 j += 1
             chunk = raw[i:j]
             if chunk:
-                run = par.add_run(chunk)
-                run.font.name = DEFAULT_FONT
+                r = par.add_run(chunk)
+                r.font.name = DEFAULT_FONT
             i = j
 
 
-def clean_custom_tags(path: str):
-    doc = DocxDocument(path)
-    for p in doc.paragraphs:
-        if "[[ROUGE:" in p.text:
-            raw = p.text
-            p.clear()
-            parts = re.split(r"(\[\[ROUGE:.*?\]\])", raw)
-            for part in parts:
-                if part.startswith("[[ROUGE:") and part.endswith("]]"):
-                    _add_red(p, part[len("[[ROUGE:"):-2].strip())
-                elif part:
-                    _add_black(p, part)
-    doc.save(path)
-
-
-def _iter_all_paragraphs(doc):
+def _iter_all_paragraphs(doc: DocxDocument):
     """
-    Retourne tous les paragraphes du document, y compris ceux contenus
-    dans les tableaux (et sous-tableaux).
+    Tous les paragraphes du document, y compris tableaux, headers et footers.
     """
 
     def iter_container(container):
-        # paragraphes directs
-        for p in container.paragraphs:
+        for p in getattr(container, "paragraphs", []):
             yield p
-        # tableaux éventuels
         for table in getattr(container, "tables", []):
             for row in table.rows:
                 for cell in row.cells:
-                    # récursif pour gérer les tableaux imbriqués
                     yield from iter_container(cell)
 
-    # corps principal du document
     yield from iter_container(doc)
 
-    # headers/footers éventuels
     for section in doc.sections:
         yield from iter_container(section.header)
         yield from iter_container(section.footer)
 
 
-import re
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt
-
-# ... le reste de writer_tpl (DEFAULT_FONT, _collapse_spaces, _add_red/_add_black, _apply_markdown_style, _iter_all_paragraphs, etc.)
-
 def format_docx(path: str):
-    from docx import Document as DocxDocument
-
+    """
+    Post-traitement global :
+    - convertit 'À compléter par le client ...' en [[ROUGE: ...]],
+    - normalise les listes (-, /, 1.) en puces / listes numérotées,
+    - applique le markdown léger (*italique*, **gras**),
+    - uniformise la police / espacement.
+    """
     doc = DocxDocument(path)
 
-    # texte "à compléter par le client" en rouge
-    pat_red = re.compile(r"(à\s*compléter\s*par\s*le\s*client\s*:?.*?)", re.IGNORECASE)
-    # liste numérotée 1. 2. 3.
-    order_re = re.compile(r"^(?P<num>\d+)[\.)]\s+(?P<txt>.+)$")
+    # "À compléter par le client" -> tag ROUGE, on laisse la couleur
+    # pour clean_custom_tags
+    pat_a_completer = re.compile(
+        r"(?i)(à\s*compléter\s*par\s*le\s*client\s*:?.*?)"
+    )
 
-    # Nouveau : détection robuste des listes de niveau 1 et 2
+    order_re = re.compile(r"^(?P<num>\d+)[\.)]\s+(?P<txt>.+)$")
     bullet_lvl1_re = re.compile(r"^[-*]\s+(?P<txt>.+)$")
     bullet_lvl2_re = re.compile(r"^/\s+(?P<txt>.+)$")
 
-    # Suivi d'un bloc de listes de niveau 2 ("/") pour appliquer la règle ; / .
     in_lvl2_block = False
     last_lvl2_par = None
 
     def close_lvl2_block():
-        """Remplace le dernier ';' du bloc de niveau 2 courant par '.'."""
         nonlocal in_lvl2_block, last_lvl2_par
         if in_lvl2_block and last_lvl2_par is not None:
             for r in reversed(last_lvl2_par.runs):
@@ -174,64 +129,42 @@ def format_docx(path: str):
         in_lvl2_block = False
         last_lvl2_par = None
 
-    # Parcours de tous les paragraphes (y compris tableaux)
     for p in _iter_all_paragraphs(doc):
+        # 0) injecter [[ROUGE: ...]] pour "À compléter par le client"
+        txt0 = p.text or ""
+        if pat_a_completer.search(txt0):
+            new_txt = pat_a_completer.sub(
+                lambda m: f"[[ROUGE: {m.group(1)} ]]", txt0
+            )
+            p.text = new_txt
+
         txt = p.text or ""
-
-        # 1) Gestion "à compléter par le client" en rouge
-        if pat_red.search(txt):
-            raw = txt
-            p.clear()
-            last = 0
-            for m in pat_red.finditer(raw):
-                if m.start() > last:
-                    _add_black(p, raw[last:m.start()])
-                _add_red(p, m.group(1))
-                last = m.end()
-            if last < len(raw):
-                _add_black(p, raw[last:])
-        else:
-            # 2) Application du markdown léger (*italique*, **gras**)
-            _apply_markdown_style(p)
-
-        # 3) Détection des listes
-        txt_after = p.text or ""
-        stripped = txt_after.lstrip("\u00A0 \t")  # espaces + NBSP
+        stripped = txt.lstrip("\u00A0 \t")
 
         m_lvl2 = bullet_lvl2_re.match(stripped)
         m_lvl1 = bullet_lvl1_re.match(stripped)
         m_ord = order_re.match(stripped)
 
         if m_lvl2:
-            # ----- Liste niveau 2: lignes commençant par "/ ..." -----
             content = _collapse_spaces(m_lvl2.group("txt"))
-            # on neutralise la ponctuation finale, on laissera close_lvl2_block faire le point final
             content = content.rstrip(" ;.")
-
             p.clear()
             run = p.add_run(f"• {content};")
             run.font.name = DEFAULT_FONT
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
             in_lvl2_block = True
             last_lvl2_par = p
 
         elif m_lvl1:
-            # ----- Liste niveau 1: lignes commençant par "- ..." ou "* ..." -----
-            # Si on sort d'un bloc de niveau 2, on clôture le ';' -> '.'
             close_lvl2_block()
-
             content = _collapse_spaces(m_lvl1.group("txt"))
-
             p.clear()
             run = p.add_run(f"• {content}")
             run.font.name = DEFAULT_FONT
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
         elif m_ord:
-            # ----- Liste numérotée 1. 2. 3. -----
             close_lvl2_block()
-
             num = m_ord.group("num")
             content = _collapse_spaces(m_ord.group("txt"))
             p.clear()
@@ -240,15 +173,66 @@ def format_docx(path: str):
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
         else:
-            # Paragraphe normal : si on sort d'un bloc de niveau 2, on ajuste le dernier ';'
             close_lvl2_block()
 
-        # 4) Format commun (espacement + police)
+        # Markdown sur le texte actuel (avec éventuellement [[ROUGE: ...]])
+        _apply_markdown_style(p)
+
+        # Formatage commun
         p.paragraph_format.space_after = Pt(11)
         for r in p.runs:
             r.font.name = DEFAULT_FONT
 
-    # Si le document se termine sur un bloc de niveau 2, on corrige le dernier ';'
     close_lvl2_block()
+    doc.save(path)
+
+
+def clean_custom_tags(path: str):
+    """
+    Remplace, dans tout le document, les séquences [[ROUGE: ...]]
+    par du texte rouge, en conservant le gras / italique des autres runs.
+    """
+    doc = DocxDocument(path)
+
+    for p in _iter_all_paragraphs(doc):
+        # Vérifier s'il y a au moins un [[ROUGE:
+        if "[[ROUGE:" not in "".join(r.text or "" for r in p.runs):
+            continue
+
+        old_runs = list(p.runs)
+        # On enlève tous les runs existants
+        for r in old_runs:
+            p._p.remove(r._r)
+
+        for r in old_runs:
+            text = r.text or ""
+            parts = re.split(r"(\[\[ROUGE:.*?\]\])", text)
+            for part in parts:
+                if not part:
+                    continue
+
+                # On clone les propriétés de police du run d’origine
+                def _new_run(txt, make_red=False):
+                    nr = p.add_run(txt)
+                    nr.font.name = r.font.name or DEFAULT_FONT
+                    nr.bold = bool(r.bold)
+                    nr.italic = bool(r.italic)
+                    nr.underline = bool(r.underline)
+                    if r.font.size is not None:
+                        nr.font.size = r.font.size
+                    if make_red:
+                        nr.font.color.rgb = RGBColor(255, 0, 0)
+                    else:
+                        # conserver la couleur éventuelle d'origine
+                        if r.font.color is not None and r.font.color.rgb is not None:
+                            nr.font.color.rgb = r.font.color.rgb
+                    return nr
+
+                if part.startswith("[[ROUGE:") and part.endswith("]]"):
+                    inner = part[len("[[ROUGE:") : -2].strip()
+                    if inner:
+                        _new_run(inner, make_red=True)
+                else:
+                    _new_run(part, make_red=False)
 
     doc.save(path)
