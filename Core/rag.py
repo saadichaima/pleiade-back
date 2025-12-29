@@ -40,8 +40,36 @@ def call_ai(prompt: str, *, meta: Optional[str] = None) -> str:
             {"role": "system", "content": "Tu es un expert du CIR/CII."},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.4,
-        max_tokens=4000,
+        temperature=0.2,
+        max_tokens=30000,
+    )
+    txt = r.choices[0].message.content or ""
+    if TOKENS_SINK:
+        u = _extract_usage(r)
+        try:
+            TOKENS_SINK(
+                {
+                    "meta": meta,
+                    **{k: int(u.get(k, 0)) for k in ("prompt_tokens", "completion_tokens", "total_tokens")},
+                }
+            )
+        except Exception:
+            pass
+    return txt
+def call_ai_json(prompt: str, *, meta: Optional[str] = None) -> str:
+    """
+    Variante 'JSON strict' :
+    - température 0 pour réduire les sorties non conformes
+    - même modèle et même infra
+    """
+    r = client.chat.completions.create(
+        model=GPT_DEPLOYMENT,
+        messages=[
+            {"role": "system", "content": "Tu es un générateur JSON strict. Tu ne renvoies que du JSON valide."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=30000,
     )
     txt = r.choices[0].message.content or ""
     if TOKENS_SINK:
@@ -317,7 +345,8 @@ def generate_ressources_humaines_from_cvs(cv_texts: List[str]):
     ctx = "\n\n".join((cv_texts or [])[:5])
     prompt = f"""
 Tu reçois le contenu brut de CVs. Pour chaque personne, rends un JSON:
-[{{"nom_prenom":"...","diplome":"...","fonction":"...","contribution":"...","temps":"[À compléter par le client]"}}...]
+
+[{{"nom_prenom":"le nom en majuscule et le prenom","diplome":"son diplome le plus elevé","fonction":"son fonction dans l'operation ","contribution":"[À compléter par le client]","temps":"[À compléter par le client]"}}...]
 CVs:
 \"\"\"{ctx}\"\"\"
 """

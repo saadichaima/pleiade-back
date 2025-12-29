@@ -41,24 +41,14 @@ def _parse_captions_raw(captions_raw: str) -> Dict[int, str]:
             out[idx] = caption
     return out
 
-
 def _plan_figures_with_llm(
     dossier_type: str,
     sections_payload: Dict[str, str],
     images_meta: List[Dict],
     max_figures: int = 5,
 ) -> Optional[Dict]:
-    """
-    Appelle l'IA pour :
-      - choisir max_figures images,
-      - insérer des mentions "Figure k" dans les sections,
-      - renvoyer un JSON { sections: {...}, mapping: [...] }.
-
-    Le prompt est chargé depuis le Blob (figures_plan.txt dans PROMPTS_CONTAINER_OTHERS).
-    """
     dt = dossier_type.upper()
 
-    # Préparation des JSON passés au prompt
     sections_json = json.dumps(sections_payload, ensure_ascii=False)
     images_json = json.dumps(
         [
@@ -73,14 +63,12 @@ def _plan_figures_with_llm(
         ensure_ascii=False,
     )
 
-    # Chargement du template de prompt depuis le Blob
     try:
         tpl = prompt_figures_plan()
     except RuntimeError as e:
         print(f"[figures_planner] {e}")
         return None
 
-    # Formatage du prompt avec les placeholders
     try:
         prompt = tpl.format(
             dossier_type=dt,
@@ -92,111 +80,114 @@ def _plan_figures_with_llm(
         print(f"[figures_planner] Erreur formatage prompt figures_plan: {e}")
         return None
 
-    raw = rag.call_ai(prompt, meta=f"Plan figures {dt}")
-    if not raw:
-        return None
+    # JSON strict
+    raw = rag.call_ai_json(prompt, meta=f"Plan figures {dt}")
 
-    raw = raw.strip()
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end == -1:
-        print("[figures_planner] JSON non détecté dans la réponse IA.")
-        return None
+    raw = raw or ""
+    raw_stripped = raw.strip()
 
-    json_str = raw[start : end + 1]
+    print("\n========== FIGURES PLANNER — RÉPONSE LLM ==========")
+    print(f"len={len(raw_stripped)}")
+    print(raw_stripped[:4000] if raw_stripped else "(vide)")
+    print("========== FIN RÉPONSE LLM ==========\n")
+
+    # Fallback propre si vide
+    if not raw_stripped:
+        return {"sections": dict(sections_payload), "mapping": []}
+
+    # Extraction du bloc JSON
+    start = raw_stripped.find("{")
+    end = raw_stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        print("[figures_planner] JSON non détecté dans la réponse IA -> fallback mapping vide.")
+        return {"sections": dict(sections_payload), "mapping": []}
+
+    json_str = raw_stripped[start : end + 1]
+
     try:
         data = json.loads(json_str)
     except Exception as e:
-        print(f"[figures_planner] Erreur parse JSON plan figures: {e}")
-        return None
+        print(f"[figures_planner] Erreur parse JSON plan figures: {e} -> fallback mapping vide.")
+        return {"sections": dict(sections_payload), "mapping": []}
 
+    # Normalisation du format
     if not isinstance(data, dict):
-        return None
+        return {"sections": dict(sections_payload), "mapping": []}
+
+    if "sections" not in data or not isinstance(data.get("sections"), dict):
+        data["sections"] = dict(sections_payload)
+
+    if "mapping" not in data or not isinstance(data.get("mapping"), list):
+        data["mapping"] = []
 
     return data
 
 
-def _semantic_filter_images(images_meta: List[Dict], min_keep: int = 3) -> List[Dict]:
+
+def _semantic_filter_images(images_meta: List[Dict], *, target_keep: int = 5) -> List[Dict]:
     """
-    Filtre les images candidates à partir de leur caption.
-
-    On garde en priorité celles qui semblent montrer :
-      - schéma, diagramme, architecture,
-      - interface, écran, tableau de bord,
-      - produit, dispositif, prototype.
-
-    On exclut les images qui semblent être :
-      - photos de personnes, réunions, conférences,
-      - photos de groupe, portraits,
-      - paysages, skyline, bâtiments, chantiers.
-
-    Si aucune image ne passe le filtre, on renvoie une liste vide
-    (=> pas de figures insérées).
+    Garde suffisamment d'images candidates pour permettre au planner
+    d'en choisir plusieurs figures (ex: 4).
+    - On score les captions (schéma/interface/produit).
+    - On garde jusqu'à target_keep.
+    - Si pas assez de “bonnes” images, on complète avec les plus grandes restantes.
     """
     positive_keywords = [
         "schéma", "schema", "diagramme", "diagram",
         "architecture", "architectur",
-        "flux", "pipeline", "processus", "workflow",
         "interface", "écran", "ecran", "dashboard", "tableau de bord",
         "graphique", "courbe", "chart",
-        "prototype", "produit", "dispositif", "capteur", "module",
-        "architecture logicielle", "architecture système",
-        "schéma fonctionnel", "schéma technique",
-        "organigramme", "bloc diagramme",
+        "prototype", "produit", "dispositif", "capteur",
     ]
-
     negative_keywords = [
-        "personne", "personnes", "gens", "public", "auditoire",
-        "groupe", "équipe", "team",
-        "salle", "conférence", "conference", "présentation", "presentation",
-        "réunion", "meeting",
-        "portrait", "selfie",
-        "bâtiment", "immeuble", "building", "chantier",
-        "paysage", "skyline", "ville", "city",
-        "photo", "photographie",
+        "photo contexte", "personne", "personnes", "réunion", "meeting",
+        "bâtiment", "ville", "paysage", "portrait", "selfie",
     ]
 
-    # On tient aussi compte des étiquettes éventuelles mises en début de caption
-    # par le prompt vision (SCHÉMA, INTERFACE, PRODUIT, PHOTO CONTEXTE, etc.)
-    def score_image(caption: str) -> int:
-        txt = (caption or "").lower()
+    def score(caption: str) -> int:
+        txt = (caption or "").lower().strip()
         if not txt:
             return 0
-
-        # Tag explicite utile (schéma, interface, produit)
-        tag_bonus = 0
-        if "schéma" in txt or "schema" in txt or "diagramme" in txt:
-            tag_bonus += 3
-        if "interface" in txt or "écran" in txt or "ecran" in txt or "dashboard" in txt:
-            tag_bonus += 2
-        if "produit" in txt or "prototype" in txt or "dispositif" in txt or "capteur" in txt:
-            tag_bonus += 2
-
-        pos = sum(1 for k in positive_keywords if k in txt)
-        neg = any(k in txt for k in negative_keywords)
-
-        if neg:
+        if any(k in txt for k in negative_keywords):
             return 0
+        s = sum(1 for k in positive_keywords if k in txt)
+        # Bonus si le préfixe Vision est explicite
+        if txt.startswith("schéma"):
+            s += 3
+        if txt.startswith("interface"):
+            s += 2
+        if txt.startswith("produit"):
+            s += 2
+        return s
 
-        return pos + tag_bonus
+    # Score
+    scored = [(score(m.get("caption", "")), m) for m in images_meta]
+    scored_pos = [m for s, m in sorted(scored, key=lambda x: x[0], reverse=True) if s > 0]
 
-    scored: List[Tuple[int, Dict]] = []
-    for m in images_meta:
-        cap = m.get("caption", "") or ""
-        s = score_image(cap)
-        if s > 0:
-            scored.append((s, m))
+    keep = []
+    used_ids = set()
 
-    if scored:
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [m for (s, m) in scored]
+    # 1) on prend les meilleures
+    for m in scored_pos:
+        if len(keep) >= target_keep:
+            break
+        keep.append(m)
+        used_ids.add(m.get("id"))
 
-    # Aucun schéma / interface / produit détecté -> pas de figures
-    print(
-        "[figures_planner] Aucun schéma/diagramme/interface/produit détecté dans les captions, "
-        "aucune figure insérée."
-    )
-    return []
+    # 2) compléter avec les plus grandes restantes si besoin
+    if len(keep) < target_keep:
+        rest = [m for m in images_meta if m.get("id") not in used_ids]
+        rest = sorted(rest, key=lambda m: int(m.get("area", 0)), reverse=True)
+        for m in rest:
+            if len(keep) >= target_keep:
+                break
+            keep.append(m)
+
+    print(f"[figures_planner] Images retenues après filtre sémantique: {len(keep)} (cible={target_keep})")
+    return keep
+
+
+
 
 
 def _prepare_figures_for_dossier(
@@ -324,7 +315,7 @@ def _prepare_figures_for_dossier(
         return sections, None, None
 
     # 8) Filtre sémantique sur les images (à partir des captions)
-    images_meta = _semantic_filter_images(images_meta, min_keep=min(3, max_figures))
+    images_meta = _semantic_filter_images(images_meta, target_keep=max_figures)
     # et on coupe à max_figures pour le LLM
     images_meta = images_meta[:max_figures]
 
@@ -344,6 +335,9 @@ def _prepare_figures_for_dossier(
         images_meta,
         max_figures=max_figures,
     )
+    print("\n========== PLAN FIGURES IA ==========\n")
+    print(plan)
+    print("\n========== FIN PLAN FIGURES IA ==========\n")
 
     # Si le plan IA est vide ou invalide -> on ne met PAS d'images
     if not plan or not isinstance(plan, dict) or not plan.get("mapping"):
@@ -415,7 +409,7 @@ def prepare_figures_for_cir(
     docs_client_data: List[Dict[str, bytes]],
     sections_cir: Dict[str, str],
     max_figures: int = 5,
-    min_side: int = 400,
+    min_side: int = 300,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Spécifique CIR : on travaille sur les sections
@@ -438,7 +432,7 @@ def prepare_figures_for_cii(
     docs_client_data: List[Dict[str, bytes]],
     sections_cii: Dict[str, str],
     max_figures: int = 5,
-    min_side: int = 400,
+    min_side: int = 300,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Spécifique CII : on travaille sur les sections
@@ -467,3 +461,38 @@ def prepare_figures_for_cii(
         max_figures=max_figures,
         min_side=min_side,
     )
+def _fix_placeholder_figure_x(sections: Dict[str, str], mapping_sorted: List[Dict]) -> Dict[str, str]:
+    """
+    Remplace 'Figure X' par un numéro valide.
+    Stratégie : remplacer par le plus petit numéro de figure non déjà présent.
+    """
+    all_nums = []
+    for m in mapping_sorted:
+        try:
+            all_nums.append(int(m.get("figure_number", 0)))
+        except Exception:
+            pass
+    all_nums = sorted(n for n in all_nums if n > 0)
+
+    if not all_nums:
+        return sections
+
+    out = dict(sections)
+
+    used = set()
+    num_re = re.compile(r"(?i)\bfigure\s+(\d+)\b")
+    for k, v in out.items():
+        for mm in num_re.finditer(v or ""):
+            try:
+                used.add(int(mm.group(1)))
+            except Exception:
+                pass
+
+    remaining = [n for n in all_nums if n not in used]
+    replacement = remaining[0] if remaining else all_nums[-1]
+
+    figx_re = re.compile(r"(?i)\bfigure\s+x\b")
+    for k, v in out.items():
+        if v:
+            out[k] = figx_re.sub(f"Figure {replacement}", v)
+    return out

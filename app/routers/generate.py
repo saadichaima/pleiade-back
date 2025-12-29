@@ -1,85 +1,72 @@
 # app/routers/generate.py
 
-from fastapi import APIRouter, UploadFile, File, Form, Response
-from typing import List, Optional, Dict
+import asyncio
+import json
 import tempfile
-from io import BytesIO
-from uuid import uuid4
+import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from uuid import uuid4
 
-from app.models.schemas import GenerateRequest
+import anyio
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from fastapi.responses import StreamingResponse
+
+from app.auth_ms import get_current_user
 from app.config import settings
+from app.models.auth import AppUser
+from app.models.schemas import GenerateRequest
 from app.services.builder import build_rag_indexes, build_sections_cir
 from app.services.builder_cii import build_sections_cii
-from app.services.cosmos_client import (
-    get_projects_container,
-    get_documents_container,
-    get_outputs_container,
-)
-from app.services.blob_client import upload_bytes_to_blob
-from app.services.figures_planner import (
-    prepare_figures_for_cir,
-    prepare_figures_for_cii,
-)
+from app.services.figures_planner import prepare_figures_for_cir, prepare_figures_for_cii
 
-from Core import document, rag, writer
-from Core import embeddings
+from Core import document, embeddings, rag, writer
 from Core import rag as core_rag
 from Core.images_figures import insert_images_by_reference_live
-from fastapi import APIRouter, UploadFile, File, Form, Response, Depends
-from app.auth_ms import get_current_user
-from app.models.auth import AppUser
 
 router = APIRouter()
 
 
-@router.post(
-    "/docx",
-    summary="Génération du dossier DOCX (CIR/CII)",
-    openapi_extra={
-        "requestBody": {
-            "content": {
-                "multipart/form-data": {
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "payload": {
-                                "type": "string",
-                                "description": "JSON de GenerateRequest",
-                            },
-                            "user_id": {
-                                "type": "string",
-                                "description": "Identifiant utilisateur (consultant)",
-                            },
-                            "docs_client": {
-                                "type": "array",
-                                "items": {"type": "string", "format": "binary"},
-                            },
-                            "docs_admin": {
-                                "type": "array",
-                                "items": {"type": "string", "format": "binary"},
-                            },
-                            "cvs": {
-                                "type": "array",
-                                "items": {"type": "string", "format": "binary"},
-                            },
-                            "logo": {
-                                "type": "string",
-                                "format": "binary",
-                            },
-                            "articles_pdfs": {
-                                "type": "array",
-                                "items": {"type": "string", "format": "binary"},
-                            },
-                        },
-                        "required": ["payload"],
-                    },
-                    "encoding": {"payload": {"contentType": "application/json"}},
-                }
-            }
-        }
-    },
-)
+# =========================
+# In-memory job registry
+# =========================
+
+@dataclass
+class _Job:
+    id: str
+    user_email: str
+    loop: asyncio.AbstractEventLoop
+    events: List[dict] = field(default_factory=list)
+    done: bool = False
+    error: Optional[str] = None
+    result: Optional[dict] = None  # {"content": bytes, "filename": str}
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+
+    async def emit(self, payload: dict) -> None:
+        async with self.cond:
+            self.events.append(payload)
+            self.cond.notify_all()
+
+    def emit_threadsafe(self, payload: dict) -> None:
+        # Called from thread: schedule emit back on event-loop
+        def _schedule():
+            asyncio.create_task(self.emit(payload))
+        self.loop.call_soon_threadsafe(_schedule)
+
+
+_JOBS: Dict[str, _Job] = {}
+
+
+def _log_progress(step: str, label: str, percent: int) -> None:
+    print(f"[PROGRESS] {percent}% — {step} — {label}")
+
+
+# =========================
+# Legacy: single-shot /docx
+# =========================
+
+@router.post("/docx", summary="Génération du dossier DOCX (CIR/CII) - réponse directe")
 async def generate_docx(
     payload: str = Form(...),
     user_id: str = Form("anonymous"),
@@ -89,141 +76,49 @@ async def generate_docx(
     logo: Optional[UploadFile] = File(None),
     articles_pdfs: List[UploadFile] = File([]),
     current_user: AppUser = Depends(get_current_user),
-
 ):
-    # ===== 0) Parse du payload & métadonnées globales =====
+    # Ce endpoint reste pour compat / debug. Il n’est pas “streamé”.
     req: GenerateRequest = GenerateRequest.model_validate_json(payload)
     info = req.info
-    type_dossier = info.type_dossier  # "CIR" | "CII"
-    user_id = current_user.email 
+    type_dossier = info.type_dossier
+    user_id = current_user.email
 
-    project_id = str(uuid4())
-    now = datetime.now(timezone.utc).isoformat()
+    _log_progress("init", "Initialisation de la génération", 5)
 
-    uploaded_docs_meta: List[dict] = []
-    print(
-        f"[generate.docx] Début génération projet={project_id}, "
-        f"type_dossier={type_dossier}"
-    )
-
-    # On garde tous les docs clients en mémoire pour le planner de figures
-    docs_client_data: List[Dict[str, bytes]] = []
-
-    # ===== 1) Extraction texte + upload Blob pour docs client / admin =====
+    # Lire fichiers
+    docs_client_data: List[Dict[str, Any]] = []
     text_client, text_admin = "", ""
 
-    # Documents techniques (docs_client)
-    for idx, f in enumerate(docs_client):
+    _log_progress("read_docs", "Analyse des documents fournis", 10)
+    for f in docs_client:
         data = await f.read()
         if not data:
             continue
-
         filename = f.filename or ""
         text_client += "\n" + document.extract_text_from_bytes(data, filename)
+        docs_client_data.append({"filename": filename, "data": data, "content_type": f.content_type or ""})
 
-        docs_client_data.append(
-            {
-                "filename": filename,
-                "data": data,
-                "content_type": f.content_type or "",
-            }
-        )
-
-        print(
-            f"[generate.docx] docs_client[{idx}] = {filename} "
-            f"(content_type={f.content_type})"
-        )
-
-        blob_name = f"{project_id}/docs_client/{idx}_{filename or 'doc'}"
-        blob_url = upload_bytes_to_blob(
-            settings.STORAGE_CONTAINER_UPLOADS,
-            blob_name,
-            data,
-            content_type=f.content_type or "application/octet-stream",
-        )
-
-        uploaded_docs_meta.append(
-            {
-                "id": f"{project_id}:docs_client:{idx}",
-                "project_id": project_id,
-                "user_id": user_id,
-                "kind": "docs_client",
-                "filename": filename,
-                "content_type": f.content_type,
-                "size": len(data),
-                "blob_url": blob_url,
-                "created_at": now,
-            }
-        )
-
-    # Documents administratifs (docs_admin)
-    for idx, f in enumerate(docs_admin):
+    for f in docs_admin:
         data = await f.read()
         if not data:
             continue
-
         filename = f.filename or ""
         text_admin += "\n" + document.extract_text_from_bytes(data, filename)
 
-        blob_name = f"{project_id}/docs_admin/{idx}_{filename or 'doc'}"
-        blob_url = upload_bytes_to_blob(
-            settings.STORAGE_CONTAINER_UPLOADS,
-            blob_name,
-            data,
-            content_type=f.content_type or "application/octet-stream",
-        )
-
-        uploaded_docs_meta.append(
-            {
-                "id": f"{project_id}:docs_admin:{idx}",
-                "project_id": project_id,
-                "user_id": user_id,
-                "kind": "docs_admin",
-                "filename": filename,
-                "content_type": f.content_type,
-                "size": len(data),
-                "blob_url": blob_url,
-                "created_at": now,
-            }
-        )
-
-    # ===== 2) Index RAG : client / admin / mix =====
+    _log_progress("rag_index", "Construction des index de recherche", 25)
     pack_client, pack_admin, pack_mix = build_rag_indexes(text_client, text_admin)
 
-    # Articles PDF (upload + RAG)
+    _log_progress("articles", "Analyse des articles scientifiques", 35)
     text_articles = ""
     articles_texts: List[str] = []
-    for idx, f in enumerate(articles_pdfs):
+    for f in articles_pdfs:
         data = await f.read()
         if not data:
             continue
-
         filename = f.filename or ""
         txt = document.extract_text_from_bytes(data, filename)
         text_articles += "\n" + txt
         articles_texts.append(txt)
-
-        blob_name = f"{project_id}/articles/{idx}_{filename or 'article.pdf'}"
-        blob_url = upload_bytes_to_blob(
-            settings.STORAGE_CONTAINER_UPLOADS,
-            blob_name,
-            data,
-            content_type=f.content_type or "application/pdf",
-        )
-
-        uploaded_docs_meta.append(
-            {
-                "id": f"{project_id}:article:{idx}",
-                "project_id": project_id,
-                "user_id": user_id,
-                "kind": "article_pdf",
-                "filename": filename,
-                "content_type": f.content_type,
-                "size": len(data),
-                "blob_url": blob_url,
-                "created_at": now,
-            }
-        )
 
     chunks_art = [c for c in document.chunk_text(text_articles) if c.strip()]
     if chunks_art:
@@ -232,318 +127,344 @@ async def generate_docx(
     else:
         pack_articles = (None, [], [])
 
-    # ===== 3) Sections (CIR / CII) =====
-    objectif = ""
-    sections_cir = None
-    sections_cii = None
-
+    _log_progress("sections", "Génération du contenu scientifique", 45)
     enriched_articles = core_rag.enrich_manual_articles_iso(
-        [a.model_dump() for a in req.articles],
-        articles_texts,
+        [a.model_dump() for a in req.articles], articles_texts
     )
-    articles_for_cir = enriched_articles
 
-    # Ces variables serviront à l'insertion d'images pour les deux types de dossiers
-    src_docx_figures: Optional[str] = None
-    captions_text: Optional[str] = None
+    src_docx_figures = None
+    captions_text = None
 
     if type_dossier == "CIR":
-        sections_cir = build_sections_cir(
-            pack_client,
-            pack_mix,
-            pack_admin,
-            pack_articles,
-            objectif,
-            "",
-            info.annee,
-            info.societe,
-            info.site_web or "",
-            articles_for_cir,
-            req.doc_complete,
-            req.externalises,
+        sections = build_sections_cir(
+            pack_client, pack_mix, pack_admin, pack_articles,
+            "", "", info.annee, info.societe, info.site_web or "",
+            enriched_articles, req.doc_complete, req.externalises
         )
-
-        # Planification dynamique des figures pour CIR
-        try:
-            sections_cir, src_docx_figures, captions_text = prepare_figures_for_cir(
-                docs_client_data,
-                sections_cir,
-                max_figures=5,
-                min_side=400,
-            )
-        except Exception as e:
-            print(f"[generate.docx] ERREUR prepare_figures_for_cir: {e!r}")
-            src_docx_figures = None
-            captions_text = None
-
+        _log_progress("figures", "Analyse et planification des figures", 55)
+        sections, src_docx_figures, captions_text = prepare_figures_for_cir(
+            docs_client_data, sections, max_figures=5, min_side=400
+        )
     else:
-        axes_from_perf = [ax for ax in (req.performance_types or []) if ax]
-        axes_from_comp = sorted(
-            {ax for comp in req.competitors for ax in (comp.axes or [])}
-        )
-        axes_cibles = axes_from_perf or axes_from_comp or [
-            "Fonctionnelles",
-            "Techniques",
-            "Ergonomiques",
-            "Écologiques",
-        ]
-
-        perf_type = (
-            axes_cibles[0] if axes_cibles else "Fonctionnelles"
-        ).strip()
-
-        sections_cii = build_sections_cii(
-            pack_client,
-            pack_mix,
-            pack_admin,
+        sections = build_sections_cii(
+            pack_client, pack_mix, pack_admin,
             info=info,
-            axes_cibles=axes_cibles,
+            axes_cibles=req.performance_types,
             concurrents=[c.model_dump() for c in req.competitors],
             total_heures="",
             contexte_societe="",
             secteur="",
             visee_generale="",
-            performance_type=perf_type,
+            performance_type="",
             doc_complete=req.doc_complete,
         )
+        _log_progress("figures", "Analyse et planification des figures", 55)
+        sections, src_docx_figures, captions_text = prepare_figures_for_cii(
+            docs_client_data, sections, max_figures=5, min_side=400
+        )
 
-        # Planification dynamique des figures pour CII
-        try:
-            sections_cii, src_docx_figures, captions_text = prepare_figures_for_cii(
-                docs_client_data,
-                sections_cii,
-                max_figures=5,
-                min_side=400,
-            )
-        except Exception as e:
-            print(f"[generate.docx] ERREUR prepare_figures_for_cii: {e!r}")
-            src_docx_figures = None
-            captions_text = None
-
-    # ===== 4) RH depuis CV =====
-    cvs_texts = []
-    for idx, f in enumerate(cvs):
+    _log_progress("rh", "Analyse des ressources humaines", 65)
+    cvs_texts: List[str] = []
+    for f in cvs:
         data = await f.read()
         if not data:
             continue
-
-        filename = f.filename or ""
-        txt = document.extract_text_from_bytes(data, filename)
-        cvs_texts.append(txt)
-
-        blob_name = f"{project_id}/cvs/{idx}_{filename or 'cv'}"
-        blob_url = upload_bytes_to_blob(
-            settings.STORAGE_CONTAINER_UPLOADS,
-            blob_name,
-            data,
-            content_type=f.content_type or "application/octet-stream",
-        )
-
-        uploaded_docs_meta.append(
-            {
-                "id": f"{project_id}:cv:{idx}",
-                "project_id": project_id,
-                "user_id": user_id,
-                "kind": "cv",
-                "filename": filename,
-                "content_type": f.content_type,
-                "size": len(data),
-                "blob_url": blob_url,
-                "created_at": now,
-            }
-        )
-
+        cvs_texts.append(document.extract_text_from_bytes(data, f.filename or ""))
     rh = rag.generate_ressources_humaines_from_cvs(cvs_texts) if cvs_texts else []
 
-    # ===== 5) Logo =====
-    logo_bytes: Optional[bytes] = None
-    if logo:
-        logo_bytes = await logo.read()
-        if logo_bytes:
-            filename = logo.filename or ""
-            blob_name = f"{project_id}/logo/{filename or 'logo'}"
-            blob_url = upload_bytes_to_blob(
-                settings.STORAGE_CONTAINER_UPLOADS,
-                blob_name,
-                logo_bytes,
-                content_type=logo.content_type or "image/png",
-            )
-            uploaded_docs_meta.append(
-                {
-                    "id": f"{project_id}:logo",
-                    "project_id": project_id,
-                    "user_id": user_id,
-                    "kind": "logo",
-                    "filename": filename,
-                    "content_type": logo.content_type,
-                    "size": len(logo_bytes),
-                    "blob_url": blob_url,
-                    "created_at": now,
-                }
-            )
-
-    # 6) Période + info
-    period = (
-        f"{info.date_debut or ''} — {info.date_fin or ''}".strip(" —")
-        if (info.date_debut or info.date_fin)
-        else str(info.annee)
-    )
-    info_dict = info.model_dump()
-    info_dict["period"] = period
-
-    if logo_bytes:
-        try:
-            from PIL import Image as PILImage
-
-            img = PILImage.open(BytesIO(logo_bytes))
-            out = BytesIO()
-            img.save(out, format="PNG")
-            png_bytes = out.getvalue()
-        except Exception:
-            png_bytes = logo_bytes
-        ftmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        ftmp.write(png_bytes)
-        ftmp.close()
-        info_dict["logo"] = ftmp.name
-
-    # 7) Payload "d" pour la template
-    if type_dossier == "CIR":
-        d = {
-            "info": info_dict,
-            "context": [sections_cir["contexte"]],
-            "verrou": [sections_cir["verrou"]],
-            "travaux": [sections_cir["travaux"]],
-            "contribution": [sections_cir["contribution"]],
-            "indicateurs": [sections_cir["indicateurs"]],
-            "partenariat": [sections_cir["partenariat"]],
-            "biblio": sections_cir["biblio"].split("\n")
-            if isinstance(sections_cir["biblio"], str)
-            else sections_cir["biblio"],
-            "entreprise": [sections_cir["entreprise"]],
-            "objectif": [sections_cir["objet"]],
-            "resume": [sections_cir["resume"]],
-            "ressources_humaines": rh,
-        }
-    else:
-        d = {
-            "info": info_dict,
-            "cii": sections_cii,
-            "ressources_humaines": rh,
-        }
-
-    # ===== 8) Enregistrement dans Cosmos DB =====
-    projects_container = get_projects_container()
-    documents_container = get_documents_container()
-
-    project_doc = {
-        "id": project_id,
-        "project_id": project_id,
-        "user_id": user_id,
-        "type_dossier": type_dossier,
-        "created_at": now,
-        "updated_at": now,
-        "payload": req.model_dump(),
-    }
-    projects_container.create_item(project_doc)
-
-    for doc_meta in uploaded_docs_meta:
-        documents_container.create_item(doc_meta)
-
-    # ===== 9) Génération DOCX (template + mise en forme + notes) =====
+    _log_progress("docx", "Génération du document Word", 75)
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
-    print(f"[generate.docx] Appel writer.generate_docx, out_path={out_path}")
+
+    logo_bytes = (await logo.read()) if logo else None
+
+    doc_payload = {"info": info.model_dump(), "ressources_humaines": rh, "sections": sections, **sections}
+    if type_dossier.upper() == "CII":
+        doc_payload["cii"] = dict(sections)
+    else:
+        doc_payload["cir"] = dict(sections)
+
     writer.generate_docx(
-        template_path=(
-            settings.TEMPLATE_CIR
-            if type_dossier == "CIR"
-            else settings.TEMPLATE_CII
-        ),
+        template_path=settings.TEMPLATE_CIR if type_dossier == "CIR" else settings.TEMPLATE_CII,
         output_path=out_path,
-        d=d,
-        branding_tokens={
-            "CLIENT": info.societe or "",
-            "20XX": str(info.annee),
-            "SITE_WEB": info.site_web or "",
-            "EMAIL": info.email or "",
-            "TELEPHONE": info.telephone or "",
-            "RESPONSABLE": info.responsable_innovation or "",
-            "TITRE_RESP": info.titre_resp or "",
-            "DIPLOME": info.diplome or "",
-            "DATE_DEBUT": info.date_debut or "",
-            "DATE_FIN": info.date_fin or "",
-            "TEMPS_OPERATION": info.temps_operation or "",
-        },
+        d=doc_payload,
+        branding_tokens={},
         logo_bytes=logo_bytes,
     )
 
-    # ===== 10) Insertion des figures dynamiques (CIR et CII) =====
+    _log_progress("insert_figures", "Insertion des figures dans le document", 85)
     if src_docx_figures:
-        try:
-            print(
-                f"[generate.docx] Insertion des figures depuis "
-                f"{src_docx_figures} dans {out_path}"
-            )
-            insert_images_by_reference_live(
-                src_docx=src_docx_figures,
-                dst_docx=out_path,
-                out_docx=out_path,
-                include_header_footer_src=False,
-                captions_text=captions_text,
-                caption_label="Figure",
-                caption_style="Caption",
-                nbspace_before_colon=True,
-                renumber_references=True,
-                target_label="Figure",
-            )
-        except Exception as e:
-            print(f"[generate.docx] ERREUR insertion figures: {e!r}")
-    else:
-        print("[generate.docx] Pas de figures dynamiques à insérer.")
+        insert_images_by_reference_live(
+            src_docx_figures, out_path, out_path,
+            captions_text=captions_text, caption_label="Figure"
+        )
 
-    # Lecture du DOCX final
+    _log_progress("finalize", "Finalisation et sauvegarde", 95)
     with open(out_path, "rb") as f:
         content = f.read()
-    year_suffix = str(info.annee)[-2:]
 
-    filename = (
-        f'{info.projet_name}_{type_dossier}_{year_suffix}_VIA.docx'
-    )
-
-    # ===== 11) Upload du DOCX généré dans Blob + enregistrement Cosmos outputs =====
-    output_blob_name = f"{project_id}/outputs/{filename}"
-    output_blob_url = upload_bytes_to_blob(
-        settings.STORAGE_CONTAINER_OUTPUTS,
-        output_blob_name,
-        content,
-        content_type=(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ),
-    )
-
-    outputs_container = get_outputs_container()
-    output_doc = {
-        "id": f"{project_id}:output",
-        "project_id": project_id,
-        "user_id": user_id,
-        "type_dossier": type_dossier,
-        "filename": filename,
-        "blob_url": output_blob_url,
-        "created_at": now,
-    }
-    outputs_container.create_item(output_doc)
-
-    print(
-        f"[generate.docx] Fin génération projet={project_id}, fichier={filename}"
-    )
+    filename = f"{info.projet_name}_{type_dossier}_{info.annee}_VIA.docx"
+    _log_progress("done", "Dossier prêt", 100)
 
     return Response(
         content,
-        media_type=(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ),
-        headers={
-            "Content-Disposition": f'attachment; filename=\"{filename}\"',
-            "X-Project-Id": project_id,
-            "X-Output-Blob-Url": output_blob_url,
-        },
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# =========================
+# Core sync generator (run in thread)
+# =========================
+
+def _generate_docx_sync(
+    req: GenerateRequest,
+    docs_client_data: List[dict],
+    docs_admin_data: List[dict],
+    cvs_data: List[dict],
+    logo_bytes: Optional[bytes],
+    articles_pdfs_data: List[dict],
+    emit: Callable[[str, str, int], Any],
+) -> Tuple[bytes, str]:
+    info = req.info
+    type_dossier = info.type_dossier
+
+    emit("init", "Initialisation de la génération", 5)
+
+    # 1) Lecture & extraction
+    emit("read_docs", "Analyse des documents fournis", 10)
+    text_client = ""
+    text_admin = ""
+    for d in docs_client_data:
+        text_client += "\n" + document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
+    for d in docs_admin_data:
+        text_admin += "\n" + document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
+
+    # 2) Index RAG
+    emit("rag_index", "Construction des index de recherche (RAG)", 25)
+    pack_client, pack_admin, pack_mix = build_rag_indexes(text_client, text_admin)
+
+    # 3) Articles
+    emit("articles", "Analyse des articles scientifiques", 35)
+    text_articles = ""
+    articles_texts: List[str] = []
+    for d in articles_pdfs_data:
+        txt = document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
+        text_articles += "\n" + txt
+        articles_texts.append(txt)
+
+    chunks_art = [c for c in document.chunk_text(text_articles) if c.strip()]
+    if chunks_art:
+        index_art, vectors_art = embeddings.build_index(chunks_art)
+        pack_articles = (index_art, chunks_art, vectors_art)
+    else:
+        pack_articles = (None, [], [])
+
+    # 4) Sections
+    emit("sections", "Génération du contenu scientifique", 45)
+    enriched_articles = core_rag.enrich_manual_articles_iso(
+        [a.model_dump() for a in req.articles], articles_texts
+    )
+
+    src_docx_figures = None
+    captions_text = None
+
+    if type_dossier == "CIR":
+        sections = build_sections_cir(
+            pack_client, pack_mix, pack_admin, pack_articles,
+            "", "", info.annee, info.societe, info.site_web or "",
+            enriched_articles, req.doc_complete, req.externalises
+        )
+        emit("figures", "Analyse et planification des figures", 55)
+        sections, src_docx_figures, captions_text = prepare_figures_for_cir(
+            docs_client_data, sections, max_figures=5, min_side=400
+        )
+    else:
+        sections = build_sections_cii(
+            pack_client, pack_mix, pack_admin,
+            info=info,
+            axes_cibles=req.performance_types,
+            concurrents=[c.model_dump() for c in req.competitors],
+            total_heures="",
+            contexte_societe="",
+            secteur="",
+            visee_generale="",
+            performance_type="",
+            doc_complete=req.doc_complete,
+        )
+        emit("figures", "Analyse et planification des figures", 55)
+        sections, src_docx_figures, captions_text = prepare_figures_for_cii(
+            docs_client_data, sections, max_figures=5, min_side=400
+        )
+
+    # 5) RH
+    emit("rh", "Analyse des ressources humaines", 65)
+    cvs_texts = [
+        document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
+        for d in cvs_data
+        if d.get("data")
+    ]
+    rh = rag.generate_ressources_humaines_from_cvs(cvs_texts) if cvs_texts else []
+
+    # 6) DOCX
+    emit("docx", "Génération du document Word", 75)
+
+    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx").name
+    doc_payload = {"info": info.model_dump(), "ressources_humaines": rh, "sections": sections, **sections}
+    if type_dossier.upper() == "CII":
+        doc_payload["cii"] = dict(sections)
+    else:
+        doc_payload["cir"] = dict(sections)
+
+    writer.generate_docx(
+        template_path=settings.TEMPLATE_CIR if type_dossier == "CIR" else settings.TEMPLATE_CII,
+        output_path=out_path,
+        d=doc_payload,
+        branding_tokens={},
+        logo_bytes=logo_bytes,
+    )
+
+    # 7) Insertion figures
+    emit("insert_figures", "Insertion des figures dans le document", 85)
+    if src_docx_figures:
+        insert_images_by_reference_live(
+            src_docx_figures, out_path, out_path,
+            captions_text=captions_text, caption_label="Figure"
+        )
+
+    # 8) Finalisation
+    emit("finalize", "Finalisation et sauvegarde", 95)
+
+    with open(out_path, "rb") as f:
+        content = f.read()
+
+    filename = f"{info.projet_name}_{type_dossier}_{info.annee}_VIA.docx"
+    emit("done", "Dossier prêt", 100)
+    return content, filename
+
+
+# =========================
+# New: JOB + SSE + DOWNLOAD
+# =========================
+
+@router.post("/jobs", summary="Démarre une génération asynchrone (retourne un job_id)")
+async def start_generate_job(
+    payload: str = Form(...),
+    docs_client: List[UploadFile] = File([]),
+    docs_admin: List[UploadFile] = File([]),
+    cvs: List[UploadFile] = File([]),
+    logo: Optional[UploadFile] = File(None),
+    articles_pdfs: List[UploadFile] = File([]),
+    current_user: AppUser = Depends(get_current_user),
+):
+    req: GenerateRequest = GenerateRequest.model_validate_json(payload)
+
+    loop = asyncio.get_running_loop()
+    job_id = str(uuid4())
+    job = _Job(id=job_id, user_email=current_user.email, loop=loop)
+    _JOBS[job_id] = job
+
+    async def _read_list(files: List[UploadFile]) -> List[dict]:
+        out: List[dict] = []
+        for f in files:
+            data = await f.read()
+            if not data:
+                continue
+            out.append({"filename": f.filename or "", "data": data, "content_type": f.content_type or ""})
+        return out
+
+    docs_client_data = await _read_list(docs_client)
+    docs_admin_data = await _read_list(docs_admin)
+    cvs_data = await _read_list(cvs)
+    articles_pdfs_data = await _read_list(articles_pdfs)
+    logo_bytes = (await logo.read()) if logo else None
+
+    async def _runner():
+        try:
+            def emit(step: str, label: str, percent: int):
+                # log serveur + SSE
+                _log_progress(step, label, percent)
+                job.emit_threadsafe({"type": "progress", "step": step, "label": label, "percent": percent})
+
+            content, filename = await anyio.to_thread.run_sync(
+                _generate_docx_sync,
+                req,
+                docs_client_data,
+                docs_admin_data,
+                cvs_data,
+                logo_bytes,
+                articles_pdfs_data,
+                emit,
+            )
+
+            job.result = {"filename": filename, "content": content}
+            job.done = True
+            await job.emit({"type": "done", "step": "done", "label": "Dossier prêt", "percent": 100})
+
+        except Exception as e:
+            job.error = str(e)
+            job.done = True
+            await job.emit({"type": "error", "message": str(e), "trace": traceback.format_exc()})
+        finally:
+            async with job.cond:
+                job.cond.notify_all()
+
+    asyncio.create_task(_runner())
+    return {"job_id": job_id}
+
+
+@router.get("/jobs/{job_id}/events", summary="Flux SSE des étapes du job")
+async def generate_job_events(job_id: str, current_user: AppUser = Depends(get_current_user)):
+    job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job introuvable")
+    if job.user_email != current_user.email:
+        raise HTTPException(status_code=403, detail="Accès interdit")
+
+    async def _stream():
+        idx = 0
+        while True:
+            async with job.cond:
+                if idx >= len(job.events) and not job.done:
+                    try:
+                        await asyncio.wait_for(job.cond.wait(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+
+                while idx < len(job.events):
+                    ev = job.events[idx]
+                    idx += 1
+                    yield "event: message\n"
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+
+                if job.done:
+                    return
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+@router.get("/jobs/{job_id}/download", summary="Télécharge le DOCX final du job")
+async def download_generate_job(job_id: str, current_user: AppUser = Depends(get_current_user)):
+    job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job introuvable")
+    if job.user_email != current_user.email:
+        raise HTTPException(status_code=403, detail="Accès interdit")
+    if not job.done:
+        raise HTTPException(status_code=202, detail="Pas prêt")
+    if job.error:
+        raise HTTPException(status_code=400, detail=job.error)
+    if not job.result:
+        raise HTTPException(status_code=500, detail="Résultat manquant")
+
+    content: bytes = job.result["content"]
+    filename: str = job.result["filename"]
+
+    # Libération mémoire après download (utile en dev)
+    _JOBS.pop(job_id, None)
+
+    return Response(
+        content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

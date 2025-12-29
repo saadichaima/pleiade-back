@@ -278,6 +278,7 @@ def _append_footnote(foot_root: etree._Element, note_id: int, text: str) -> None
     t_el.text = text
 
 
+
 # =======================
 # Utils runs / wrappers
 # =======================
@@ -304,7 +305,34 @@ def _copy_rPr(dst_run, src_run):
     dst_pr = etree.SubElement(dst_run, f"{{{NS['w']}}}rPr")
     for child in src_pr:
         dst_pr.append(etree.fromstring(etree.tostring(child)))
+def _add_footnote_number_run(parent_p: etree._Element):
+    """
+    Ajoute le run Word qui affiche automatiquement le numéro de la note.
+    OBLIGATOIRE pour que Word montre le numéro dans la note.
+    """
+    run_num = etree.SubElement(parent_p, f"{{{NS['w']}}}r")
+    rPr = etree.SubElement(run_num, f"{{{NS['w']}}}rPr")
+    etree.SubElement(
+        rPr,
+        f"{{{NS['w']}}}rStyle",
+        attrib={f"{{{NS['w']}}}val": "FootnoteReference"},
+    )
+    etree.SubElement(
+        rPr,
+        f"{{{NS['w']}}}vertAlign",
+        attrib={f"{{{NS['w']}}}val": "superscript"},
+    )
+    etree.SubElement(run_num, f"{{{NS['w']}}}footnoteRef")
 
+def _add_space_after_footnote_number(parent_p: etree._Element):
+    """
+    Ajoute un espace après le numéro automatique de note
+    pour améliorer la lisibilité (ex: '10 Compostage').
+    """
+    r = etree.SubElement(parent_p, f"{{{NS['w']}}}r")
+    t = etree.SubElement(r, f"{{{NS['w']}}}t")
+    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    t.text = " "
 
 def _insert_sequence_at(parent_run: etree._Element, run_seq) -> None:
     """
@@ -418,6 +446,7 @@ def insert_footnotes(docx_path: str, glossary: Dict[str, str], out_path: str = N
             p = etree.SubElement(foot_root, f"{{{NS['w']}}}footnote")
             p.set(f"{{{NS['w']}}}id", str(next_id))
             pp = etree.SubElement(p, f"{{{NS['w']}}}p")
+            _add_footnote_number_run(pp)
 
             def _add_run(text: str, bold: bool = False):
                 r = etree.SubElement(pp, f"{{{NS['w']}}}r")
@@ -435,6 +464,7 @@ def insert_footnotes(docx_path: str, glossary: Dict[str, str], out_path: str = N
                 t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
                 t_el.text = text
 
+            _add_space_after_footnote_number(pp)
             _add_run(f"{term} : ", bold=True)
             _add_run(definition)
 

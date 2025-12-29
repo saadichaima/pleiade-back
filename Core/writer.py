@@ -1,57 +1,101 @@
 # Core/writer.py
-from io import BytesIO
-from typing import Optional, Dict, Any
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, Optional
 
 from docxtpl import DocxTemplate, InlineImage
 from docx.shared import Cm
 
-from .writer_tpl import clean_custom_tags, format_docx
-from Core import footnotes
+from Core.writer_tpl import format_docx, clean_custom_tags
+from Core.footnotes import auto_annotate_docx_with_footnotes
+
+
+# Caractères interdits dans XML 1.0 (Word)
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+def _sanitize_text_for_docx(s: str) -> str:
+    """
+    Rend une chaîne sûre pour injection dans docxtpl (XML Word).
+    - retire caractères de contrôle illégaux
+    - échappe &, <, >
+    """
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+
+    s = _XML_ILLEGAL_RE.sub("", s)
+
+    # IMPORTANT: docxtpl injecte du XML si on ne protège pas
+    s = s.replace("&", "&amp;")
+    s = s.replace("<", "&lt;")
+    s = s.replace(">", "&gt;")
+    return s
+
+
+def _sanitize_context(obj: Any) -> Any:
+    """
+    Sanitization récursive du contexte Jinja/DocxTpl :
+    - str -> sanitize
+    - dict/list/tuple -> recurse
+    - autres -> inchangé
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return _sanitize_text_for_docx(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_context(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_context(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_sanitize_context(v) for v in obj)
+    return obj
 
 
 def generate_docx(
     template_path: str,
     output_path: str,
     d: Dict[str, Any],
-    branding_tokens: Optional[Dict[str, str]] = None,
+    branding_tokens: Optional[Dict[str, Any]] = None,
     logo_bytes: Optional[bytes] = None,
 ) -> str:
     """
-    Rend la template docx avec le contexte 'd' + tokens de branding.
-    Après rendu :
-    - formate le document (Markdown, listes, 'À compléter...'),
-    - remplace les tags [[ROUGE:...]] par du texte rouge,
-    - puis insère des notes de bas de page (termes techniques + URLs).
+    Génère un DOCX via docxtpl puis post-traite (listes/markdown/rouge/footnotes).
+    Correction critique : sanitization du texte avant doc.render() pour éviter la
+    corruption XML (ex: '<https://...>' ou tout '<...>').
     """
+    branding_tokens = branding_tokens or {}
+
     doc = DocxTemplate(template_path)
 
-    branding = dict(branding_tokens or {})
-    if logo_bytes:
-        try:
-            branding["LOGO"] = InlineImage(doc, BytesIO(logo_bytes), width=Cm(4))
-        except Exception:
-            pass
-
-    context = {
+    # Construction du contexte attendu par le template
+    context: Dict[str, Any] = {
         "d": d,
-        "cm": Cm,
-        **branding,
-        "BRANDING": branding,
+        **(branding_tokens or {}),
     }
+
+    # Logo (si ton template l'utilise)
+    if logo_bytes:
+        # InlineImage attend un chemin ou un file-like; DocxTpl accepte BytesIO.
+        from io import BytesIO
+        context["logo"] = InlineImage(doc, BytesIO(logo_bytes), width=Cm(3))
+
+    # SANITIZE: éviter DOCX corrompu par du texte non échappé
+    context = _sanitize_context(context)
+
+    # Render & save
     doc.render(context)
     doc.save(output_path)
 
-    # 1) Mise en forme (markdown, listes, tagging 'À compléter...')
+    # Post-traitement (listes, markdown, tags rouge, footnotes)
     format_docx(output_path)
-
-    # 2) Conversion de tous les [[ROUGE: ...]] en rouge
     clean_custom_tags(output_path)
-
-    # 3) Notes de bas de page (glossaire + URLs)
-    footnotes.auto_annotate_docx_with_footnotes(
+    auto_annotate_docx_with_footnotes(
         output_path,
         use_llm_terms=True,
-        max_terms=20,
+        max_terms=15,
         add_url_footnotes=True,
     )
 

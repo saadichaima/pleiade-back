@@ -4,6 +4,7 @@ import re
 import io
 import tempfile
 from typing import List, Tuple, Dict, Optional
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from docx import Document
 from docx.text.paragraph import Paragraph
@@ -300,8 +301,37 @@ def _add_picture_to_paragraph_live(doc: Document, p_elm, image_bytes: bytes, wid
 
 
 def _max_text_width_emu(doc: Document) -> int:
+    """
+    Calcule la largeur disponible pour une image INLINE.
+    - Si le document est en colonnes (ex: 2), renvoie la largeur d'une colonne.
+    - Sinon, renvoie la largeur pleine (page - marges).
+    """
     sect = doc.sections[0]
-    return int(sect.page_width - sect.left_margin - sect.right_margin)
+    full_text_width = int(sect.page_width - sect.left_margin - sect.right_margin)
+
+    # Détection colonnes via sectPr (python-docx ne l’expose pas proprement)
+    try:
+        cols_elms = sect._sectPr.xpath(".//*[local-name()='cols']")
+        if cols_elms:
+            cols = cols_elms[0]
+            num = cols.get(qn("w:num")) or cols.get("num")  # selon version
+            space = cols.get(qn("w:space")) or cols.get("space")
+            num_cols = int(num) if num and str(num).isdigit() else 1
+            space_twips = int(space) if space and str(space).isdigit() else 0
+
+            # Conversion Twips -> EMU (1 twip = 635 EMU)
+            space_emu = space_twips * 635
+
+            if num_cols and num_cols > 1:
+                # largeur colonne ≈ (largeur totale - espaces entre colonnes) / nb colonnes
+                total_gutters = space_emu * (num_cols - 1)
+                col_width = max(1, (full_text_width - total_gutters) // num_cols)
+                return int(col_width)
+    except Exception:
+        pass
+
+    return int(full_text_width)
+
 
 
 # ==========================
@@ -357,7 +387,6 @@ def _caption_for_num(captions_text, num: int):
 # ==========================
 # Fonction principale : insertion des images par référence
 # ==========================
-
 def insert_images_by_reference_live(
     src_docx: str,
     dst_docx: str,
@@ -367,145 +396,101 @@ def insert_images_by_reference_live(
     caption_label: str = "Figure",
     caption_style: str = "Caption",
     nbspace_before_colon: bool = True,
-    renumber_references: bool = True,
+    renumber_references: bool = False,
     target_label: str = "Figure",
 ) -> str:
     """
-    Nouvelle version basée sur python-docx :
-    - lit les images du DOCX source (src_docx),
-    - parcourt tous les Paragraph du DOCX cible (dst_docx),
-    - renumérote les références 'Figure X' / 'Image X',
-    - insère, à la première occurrence de chaque numéro, l'image correspondante
-      sous le paragraphe, avec une légende optionnelle.
+    Insère les images juste après le paragraphe qui contient une référence
+    de type 'cf. Figure N' ou 'voir Figure N'.
     """
     print(
         f"[images_figures] insert_images_by_reference_live: src={src_docx}, "
         f"dst={dst_docx}, out={out_docx}"
     )
 
-    # 1) Index des images du DOCX source (numéro d'origine -> (bytes, ext))
     images = extract_images_from_docx_ordered_any(
         src_docx, include_header_footer=include_header_footer_src
     )
     num_to_img = {i + 1: im for i, im in enumerate(images)}
-    print(
-        f"[images_figures] {len(num_to_img)} image(s) indexée(s) "
-        f"depuis le DOCX source"
-    )
+    print(f"[images_figures] {len(num_to_img)} image(s) indexée(s) depuis le DOCX source")
 
-    # 2) Document cible
     docB = Document(dst_docx)
     width_emu = _max_text_width_emu(docB)
     nbsp = "\u202F" if nbspace_before_colon else " "
 
-    # État
-    ref_seen: set[int] = set()
-    old2new: Dict[int, int] = {}
-    inserted_for_old: set[int] = set()
-    next_new_idx = 1
+    # Références uniquement (évite les légendes "Figure 1 :")
+    REF_RE = re.compile(
+        r"(?i)\b(?:cf\.\s*|voir\s+)(?:fig(?:\.|ure)?|image)\s*[:\-–]?\s*(\d+)\b"
+    )
+
+    inserted_for_num: set[int] = set()
     inserted_count = 0
     missing_count = 0
+    seen_refs: set[int] = set()
 
-    # Helper pour formater le texte remplacé
-    def _replace_in_text(text: str):
-        nonlocal next_new_idx
-        if not text:
-            return text, []
+    def _host_paragraph_text(p: Paragraph) -> str:
+        try:
+            ts = p._p.xpath(".//*[local-name()='t']")
+        except Exception:
+            ts = []
+        txt = "".join((getattr(t, "text", None) or "") for t in ts)
+        return _norm_space(txt)
 
-        new_text_parts = []
-        idx_last = 0
-        nums_in_this_para: List[int] = []
-
-        for m in FIG_PATTERN.finditer(text):
-            start, end = m.span()
-            full = m.group(0)
-            old_num = int(m.group(1))
-
-            # texte avant la référence
-            new_text_parts.append(text[idx_last:start])
-
-            # renumérotation
-            if old_num not in old2new:
-                old2new[old_num] = next_new_idx
-                next_new_idx += 1
-            new_num = old2new[old_num]
-
-            # préfixe cf. éventuel
-            has_cf = re.search(r"(?i)\bcf\.\s*", full) is not None
-            prefix = "cf. " if has_cf else ""
-
-            if renumber_references:
-                repl = f"{prefix}{target_label} {new_num}"
-            else:
-                repl = full
-
-            new_text_parts.append(repl)
-            idx_last = end
-
-            ref_seen.add(old_num)
-            if old_num not in nums_in_this_para:
-                nums_in_this_para.append(old_num)
-
-        new_text_parts.append(text[idx_last:])
-        return "".join(new_text_parts), nums_in_this_para
-
-    # 3) Parcours de tous les paragraphes (y compris tableaux, headers, footers)
     for p in _iter_all_paragraphs_doc(docB):
-        original_txt = _norm_space(p.text or "")
-        if not original_txt:
+        txt = _host_paragraph_text(p)
+        if not txt:
             continue
 
-        new_txt, nums_here = _replace_in_text(original_txt)
+        nums_here = []
+        for m in REF_RE.finditer(txt):
+            try:
+                nums_here.append(int(m.group(1)))
+            except Exception:
+                continue
 
-        # Si pas de référence dans ce paragraphe, on passe
+        # dédoublonnage en gardant l’ordre
+        uniq = []
+        for n in nums_here:
+            if n not in uniq:
+                uniq.append(n)
+        nums_here = uniq
+
         if not nums_here:
             continue
 
-        # On remplace le texte du paragraphe (perte de styles inline possible)
-        if new_txt != original_txt:
-            p.text = new_txt
+        for n in nums_here:
+            seen_refs.add(n)
 
-        # Pour chaque numéro rencontré dans ce paragraphe, on insère l'image
-        # uniquement à la première occurrence globale
-        for old_num in nums_here:
-            if old_num in inserted_for_old:
+        # insertion après le paragraphe hôte
+        for fig_num in reversed(nums_here):
+            if fig_num in inserted_for_num:
                 continue
-
-            if old_num not in num_to_img:
-                # référence sans image correspondante
+            if fig_num not in num_to_img:
                 missing_count += 1
                 continue
 
-            img_bytes, _ext = num_to_img[old_num]
+            img_bytes, _ext = num_to_img[fig_num]
+            new_img_p = _insert_paragraph_after_live(p._p)
+            _add_picture_to_paragraph_live(docB, new_img_p, img_bytes, width_emu)
 
-            # insertion juste après ce paragraphe
-            new_p_elm = _insert_paragraph_after_live(p._p)
-            _add_picture_to_paragraph_live(docB, new_p_elm, img_bytes, width_emu)
-
-            # Légende optionnelle
-            cap_txt = _caption_for_num(captions_text, old_num)
+            cap_txt = _caption_for_num(captions_text, fig_num)
             if cap_txt:
-                cap_p_elm = _insert_paragraph_after_live(new_p_elm)
-                para_cap = Paragraph(cap_p_elm, docB._body)
+                cap_p = _insert_paragraph_after_live(new_img_p)
+                para_cap = Paragraph(cap_p, docB._body)
                 try:
                     if caption_style:
                         para_cap.style = caption_style
                 except Exception:
                     pass
-                new_idx = old2new.get(old_num, old_num)
-                para_cap.add_run().text = (
-                    f"{caption_label} {new_idx}{nbsp}:{nbsp}{cap_txt}"
-                )
+                para_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                para_cap.add_run().text = f"{caption_label} {fig_num}{nbsp}:{nbsp}{cap_txt}"
 
-            inserted_for_old.add(old_num)
+            inserted_for_num.add(fig_num)
             inserted_count += 1
 
     docB.save(out_docx)
-
     print(
-        f"[images_figures] terminé. Références vues: "
-        f"{sorted(ref_seen) if ref_seen else 'aucune'}, "
-        f"images insérées: {inserted_count}, "
-        f"références sans image: {missing_count}"
+        f"[images_figures] terminé. Références vues: {sorted(seen_refs) if seen_refs else 'aucune'}, "
+        f"images insérées: {inserted_count}, références sans image: {missing_count}"
     )
     return out_docx

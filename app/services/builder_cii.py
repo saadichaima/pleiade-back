@@ -2,7 +2,7 @@
 from typing import Dict, Any
 from Core import rag_cii
 from Core import rag
-from Core.list_format import format_ciiperf_lists  
+ 
 
 def build_sections_cii(
     index_client_pack,   # (index, chunks, vectors) pour docs techniques
@@ -106,7 +106,7 @@ def build_sections_cii(
         performance_type=performance_type,
         liste_concurrents=liste_concurrents,
     )
-    analyse = format_ciiperf_lists(analyse)
+
 
 
     performances = rag_cii.gen_performances(
