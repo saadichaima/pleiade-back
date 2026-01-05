@@ -17,20 +17,20 @@ _XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 def _sanitize_text_for_docx(s: str) -> str:
     """
     Rend une chaîne sûre pour injection dans docxtpl (XML Word).
-    - retire caractères de contrôle illégaux
-    - échappe &, <, >
+    - retire UNIQUEMENT les caractères de contrôle illégaux
+
+    NOTE IMPORTANTE : DocxTpl gère déjà l'échappement XML automatiquement.
+    Ne pas échapper manuellement &, <, > car cela crée un double échappement
+    qui corrompt les caractères accentués (é → Ã©, ' → â€™, etc.)
     """
     if s is None:
         return ""
     if not isinstance(s, str):
         s = str(s)
 
+    # Retire uniquement les caractères de contrôle XML illégaux
     s = _XML_ILLEGAL_RE.sub("", s)
 
-    # IMPORTANT: docxtpl injecte du XML si on ne protège pas
-    s = s.replace("&", "&amp;")
-    s = s.replace("<", "&lt;")
-    s = s.replace(">", "&gt;")
     return s
 
 

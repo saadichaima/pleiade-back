@@ -515,7 +515,8 @@ def _first_url_in_text(s: str):
         else "bare"
     )
     url = m.group(grp)
-    s_idx, e_idx = m.span(grp)
+    # Utiliser m.span(0) pour obtenir les positions incluant les délimiteurs
+    s_idx, e_idx = m.span(0)
     if grp == "bare" and url and url[-1] in _TAIL_PUNCT:
         k = 0
         while k < len(url) and url[-(k + 1)] in _TAIL_PUNCT:
@@ -535,28 +536,10 @@ def _process_single_url_in_run(t_node: etree._Element, foot_root: etree._Element
     grp, s_idx, e_idx, url = found
     parent_run = t_node.getparent()
 
-    # Supprimer les délimiteurs autour de l'URL
-    # grp indique le type: "angle" (<>), "paren" (()), "brack" ([]), "bare" (rien)
-    delimiter_offset_left = 0
-    delimiter_offset_right = 0
-
-    if grp == "angle":
-        # <https://...> -> supprimer < et >
-        delimiter_offset_left = 1  # décaler à gauche pour inclure <
-        delimiter_offset_right = 1  # décaler à droite pour inclure >
-    elif grp == "paren":
-        # (https://...) -> supprimer ( et )
-        delimiter_offset_left = 1
-        delimiter_offset_right = 1
-    elif grp == "brack":
-        # [https://...] -> supprimer [ et ]
-        delimiter_offset_left = 1
-        delimiter_offset_right = 1
-    # Si "bare", pas de délimiteurs à supprimer
-
-    # Ajuster les indices pour inclure les délimiteurs dans la suppression
-    left = text[:s_idx - delimiter_offset_left]
-    right = text[e_idx + delimiter_offset_right:]
+    # s_idx et e_idx incluent maintenant les délimiteurs (grâce à m.span(0))
+    # Donc on supprime tout: délimiteurs + URL
+    left = text[:s_idx]
+    right = text[e_idx:]
 
     t_node.text = left
 

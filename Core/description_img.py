@@ -301,11 +301,12 @@ def _call_azure_vision(
     """
     Appelle Azure Vision une fois.
     """
+    # GPT-5.2+ utilise max_completion_tokens au lieu de max_tokens
+    # GPT-5.2 n'accepte pas temperature=0.0, on ne spécifie pas le paramètre
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": parts}],
-        max_tokens=max_output_tokens,
-        temperature=temperature,
+        max_completion_tokens=max_output_tokens,
     )
     try:
         print("Tokens utilisés :", resp.usage)

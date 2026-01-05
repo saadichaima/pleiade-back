@@ -192,6 +192,50 @@ async def get_current_user(claims: dict = Depends(get_aad_claims)) -> AppUser:
     return user
 
 
+async def get_current_user_with_query_token(
+    token: str = None,
+    creds: HTTPAuthorizationCredentials = Depends(security),
+) -> AppUser:
+    """
+    Variante de get_current_user qui accepte le token via query param.
+    Utilisé pour les endpoints SSE où EventSource ne peut pas passer de headers.
+
+    Priorité :
+    1. Header Authorization: Bearer <token>
+    2. Query param ?token=<token>
+    """
+    # Essayer d'abord le header (préféré)
+    if creds is not None:
+        token_to_use = creds.credentials
+    # Sinon, utiliser le query param
+    elif token:
+        token_to_use = token
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token manquant (header Authorization ou query param ?token requis).",
+        )
+
+    # Décoder et valider le token
+    claims = _decode_aad_token(token_to_use)
+
+    # Extraire l'email et vérifier l'utilisateur
+    email = _extract_email_from_claims(claims)
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email absent du token Microsoft.",
+        )
+
+    user = get_user_by_email(email)
+    if not user or not user.active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Vous n'êtes pas autorisé à utiliser cette application.",
+        )
+    return user
+
+
 async def require_admin(user: AppUser = Depends(get_current_user)) -> AppUser:
     if user.role != "admin":
         raise HTTPException(

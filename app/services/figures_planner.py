@@ -81,7 +81,7 @@ def _plan_figures_with_llm(
         return None
 
     # JSON strict
-    raw = rag.call_ai_json(prompt, meta=f"Plan figures {dt}")
+    raw = rag.call_ai(prompt, meta=f"Plan figures {dt}")
 
     raw = raw or ""
     raw_stripped = raw.strip()
@@ -329,15 +329,21 @@ def _prepare_figures_for_dossier(
         sections_payload[key] = sections.get(key, "") or ""
 
     # 10) Planification des figures par l'IA
-    plan = _plan_figures_with_llm(
-        dossier_type,
-        sections_payload,
-        images_meta,
-        max_figures=max_figures,
-    )
-    print("\n========== PLAN FIGURES IA ==========\n")
-    print(plan)
-    print("\n========== FIN PLAN FIGURES IA ==========\n")
+    try:
+        plan = _plan_figures_with_llm(
+            dossier_type,
+            sections_payload,
+            images_meta,
+            max_figures=max_figures,
+        )
+        print("\n========== PLAN FIGURES IA ==========\n")
+        print(plan)
+        print("\n========== FIN PLAN FIGURES IA ==========\n")
+    except Exception as e:
+        print(f"[figures_planner] Erreur lors de la planification des figures: {e}")
+        import traceback
+        traceback.print_exc()
+        return sections, None, None
 
     # Si le plan IA est vide ou invalide -> on ne met PAS d'images
     if not plan or not isinstance(plan, dict) or not plan.get("mapping"):
@@ -410,6 +416,7 @@ def prepare_figures_for_cir(
     sections_cir: Dict[str, str],
     max_figures: int = 5,
     min_side: int = 300,
+    max_images_candidates: int = 10,  # Limite à 10 images max pour éviter les timeouts
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Spécifique CIR : on travaille sur les sections
@@ -425,6 +432,7 @@ def prepare_figures_for_cir(
         section_keys,
         max_figures=max_figures,
         min_side=min_side,
+        max_images_candidates=max_images_candidates,
     )
 
 
@@ -433,6 +441,7 @@ def prepare_figures_for_cii(
     sections_cii: Dict[str, str],
     max_figures: int = 5,
     min_side: int = 300,
+    max_images_candidates: int = 10,  # Limite à 10 images max pour éviter les timeouts
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Spécifique CII : on travaille sur les sections
@@ -460,6 +469,7 @@ def prepare_figures_for_cii(
         section_keys,
         max_figures=max_figures,
         min_side=min_side,
+        max_images_candidates=max_images_candidates,
     )
 def _fix_placeholder_figure_x(sections: Dict[str, str], mapping_sorted: List[Dict]) -> Dict[str, str]:
     """

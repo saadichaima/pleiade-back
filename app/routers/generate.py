@@ -13,7 +13,7 @@ import anyio
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import StreamingResponse
 
-from app.auth_ms import get_current_user
+from app.auth_ms import get_current_user, get_current_user_with_query_token
 from app.config import settings
 from app.models.auth import AppUser
 from app.models.schemas import GenerateRequest
@@ -354,7 +354,20 @@ async def start_generate_job(
 
 
 @router.get("/jobs/{job_id}/events", summary="Flux SSE des étapes du job")
-async def generate_job_events(job_id: str, current_user: AppUser = Depends(get_current_user)):
+async def generate_job_events(
+    job_id: str,
+    current_user: AppUser = Depends(get_current_user_with_query_token)
+):
+    """
+    Endpoint SSE pour suivre la progression d'un job.
+
+    Authentification :
+    - Via header Authorization: Bearer <token> (préféré)
+    - Via query param ?token=<token> (fallback pour EventSource)
+
+    Note : EventSource (navigateur) ne supporte pas les headers customs,
+    donc on accepte aussi le token en query param.
+    """
     job = _JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job introuvable")
