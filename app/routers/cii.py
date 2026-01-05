@@ -144,9 +144,19 @@ async def cii_suggest_competitors(
             ),
         )
 
-    # 4) Parsing JSON
+    # 4) Parsing JSON - nettoyer les marqueurs markdown si présents
+    raw_clean = raw.strip()
+    # Supprimer les balises markdown ```json ... ``` si présentes
+    if raw_clean.startswith("```json"):
+        raw_clean = raw_clean[7:]  # enlever ```json
+    elif raw_clean.startswith("```"):
+        raw_clean = raw_clean[3:]  # enlever ```
+    if raw_clean.endswith("```"):
+        raw_clean = raw_clean[:-3]  # enlever ```
+    raw_clean = raw_clean.strip()
+
     try:
-        data = json.loads(raw)
+        data = json.loads(raw_clean)
         if not isinstance(data, list):
             raise ValueError("JSON racine != liste")
     except Exception as e:
@@ -157,10 +167,7 @@ async def cii_suggest_competitors(
 
     out_items: List[SuggestedCompetitor] = []
     for item in data:
-        try:
-            name = (item.get("name") or "").trim()
-        except AttributeError:
-            name = (item.get("name") or "").strip()
+        name = (item.get("name") or "").strip()
         if not name:
             continue
         site = (item.get("site") or "").strip()

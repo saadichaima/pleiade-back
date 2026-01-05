@@ -532,11 +532,31 @@ def _process_single_url_in_run(t_node: etree._Element, foot_root: etree._Element
     if not found:
         return next_id
 
-    _, s_idx, e_idx, url = found
+    grp, s_idx, e_idx, url = found
     parent_run = t_node.getparent()
 
-    left = text[:s_idx]
-    right = text[e_idx:]
+    # Supprimer les délimiteurs autour de l'URL
+    # grp indique le type: "angle" (<>), "paren" (()), "brack" ([]), "bare" (rien)
+    delimiter_offset_left = 0
+    delimiter_offset_right = 0
+
+    if grp == "angle":
+        # <https://...> -> supprimer < et >
+        delimiter_offset_left = 1  # décaler à gauche pour inclure <
+        delimiter_offset_right = 1  # décaler à droite pour inclure >
+    elif grp == "paren":
+        # (https://...) -> supprimer ( et )
+        delimiter_offset_left = 1
+        delimiter_offset_right = 1
+    elif grp == "brack":
+        # [https://...] -> supprimer [ et ]
+        delimiter_offset_left = 1
+        delimiter_offset_right = 1
+    # Si "bare", pas de délimiteurs à supprimer
+
+    # Ajuster les indices pour inclure les délimiteurs dans la suppression
+    left = text[:s_idx - delimiter_offset_left]
+    right = text[e_idx + delimiter_offset_right:]
 
     t_node.text = left
 

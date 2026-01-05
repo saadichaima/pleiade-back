@@ -391,19 +391,89 @@ def gen_rh_intro(
     annee,
     total_heures: str = "",
     performance_type: str = "",
-) -> str:
+) -> dict:
     instr = _build(
         _tmpl_cii("rh_intro"),
         annee=annee,
         total_heures=total_heures,
         performance_type=performance_type,
     )
-    raw= generate_section_with_rag(
+
+    # Améliorer le prompt pour forcer un JSON valide
+    enhanced_instr = instr + """
+
+IMPORTANT: Extrait les informations sur le personnel UNIQUEMENT à partir des documents fournis.
+Ne génère PAS de valeurs fictives ou de placeholder comme "[À compléter par le client]".
+Si une information n'est PAS présente dans les documents, utilise une chaîne vide "".
+
+Renvoie un JSON valide avec cette structure:
+```json
+{
+  "introduction": "Texte d'introduction sur les ressources humaines...",
+  "personnel": [
+    {
+      "nom_prenom": "NOM Prénom réel trouvé dans les docs",
+      "diplome": "Diplôme réel ou vide",
+      "fonction": "Fonction réelle ou vide",
+      "contribution": "Contribution réelle ou vide",
+      "temps": "Heures réelles ou vide"
+    }
+  ]
+}
+```
+
+Renvoie UNIQUEMENT le JSON, sans texte avant ni après, sans markdown."""
+
+    raw = generate_section_with_rag(
         "Introduction RH",
-        instr,
+        enhanced_instr,
         i, c, v,
     )
-    return _normalize_md_lists(raw)
+
+    # Parser le JSON et extraire les données
+    try:
+        import json
+        import re
+
+        # Nettoyer et extraire le JSON
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(?:json)?\s*\n', '', cleaned)
+            cleaned = re.sub(r'\n```\s*$', '', cleaned)
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        if start != -1 and end > start:
+            json_str = cleaned[start:end]
+            data = json.loads(json_str)
+
+            intro = data.get("introduction", "").strip()
+            personnel = data.get("personnel", [])
+
+            # Nettoyer les valeurs "[À compléter par le client]"
+            for person in personnel:
+                for key in list(person.keys()):
+                    val = str(person[key])
+                    if "[" in val and "compléter" in val.lower():
+                        person[key] = ""
+
+            # Retourner la structure de données pour le template Jinja
+            return {
+                "introduction": intro,
+                "personnel": personnel
+            }
+
+    except json.JSONDecodeError as e:
+        print(f"[RH] Erreur parsing JSON: {e}")
+        print(f"[RH] Contenu reçu: {raw[:200]}...")
+    except Exception as e:
+        print(f"[RH] Erreur inattendue: {e}")
+
+    # Fallback: retourner une structure minimale
+    return {
+        "introduction": raw,
+        "personnel": []
+    }
 
 
 def get_biblio_intro() -> str:

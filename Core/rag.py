@@ -4,24 +4,43 @@ from typing import Optional, Dict, Any, List, Callable
 import re
 
 from dotenv import load_dotenv
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 
 from Core.embeddings import embed_texts
 from app.services.prompts import fetch_cir, fetch_cii, prompt_evaluateur_travaux
 
 load_dotenv()
 
-# -------------------- Azure OpenAI --------------------
-client = AzureOpenAI(
-    api_key=os.getenv("AZURE_OPENAI_KEY"),
-    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-)
+# Détection du type d'API : Responses API (GPT-5.2+) ou Chat Completions API (GPT-4.1)
+API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "")
+USE_RESPONSES_API = API_VERSION.startswith("2025-") or "2025" in API_VERSION
+
+if USE_RESPONSES_API:
+    # Nouvelle API Responses pour GPT-5.2
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    # Garder cognitiveservices.azure.com pour Azure
+    base_url = endpoint.rstrip("/") + "/openai/v1/"
+
+    print(f"[DEBUG] Using Responses API with base_url: {base_url}")
+
+    client = OpenAI(
+        api_key=os.getenv("AZURE_OPENAI_KEY"),
+        base_url=base_url,
+    )
+
+    print(f"[DEBUG] Client type: {type(client)}, has responses: {hasattr(client, 'responses')}")
+else:
+    # Ancienne API Chat Completions pour GPT-4.1
+    client = AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_KEY"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_version=API_VERSION,
+    )
+
 GPT_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
 TOKENS_SINK: Optional[Callable[[Dict[str, Any]], None]] = None
 def set_tokens_sink(fn: Callable[[Dict[str, Any]], None]):
-    """Instrumentation optionnelle pour récupérer la conso tokens."""
     global TOKENS_SINK
     TOKENS_SINK = fn
 
@@ -33,65 +52,65 @@ def _extract_usage(resp):
     except Exception:
         return {}
 
-def call_ai(prompt: str, *, meta: Optional[str] = None) -> str:
-    r = client.chat.completions.create(
-        model=GPT_DEPLOYMENT,
-        messages=[
-            {"role": "system", "content": "Tu es un expert du CIR/CII."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=30000,
-    )
-    txt = r.choices[0].message.content or ""
-    if TOKENS_SINK:
-        u = _extract_usage(r)
-        try:
-            TOKENS_SINK(
-                {
+def call_ai(prompt: str, *, meta: Optional[str] = None, temperature: float = 0.2, max_tokens: int = 30000) -> str:
+    if USE_RESPONSES_API:
+        # Nouvelle API Responses pour GPT-5.2
+        # Note: GPT-5.2 ne supporte pas le paramètre temperature
+        r = client.responses.create(
+            model=GPT_DEPLOYMENT,
+            input=[
+                {"role": "system", "content": "Tu es un expert du CIR/CII."},
+                {"role": "user", "content": prompt},
+            ],
+            max_output_tokens=max_tokens,
+        )
+        txt = r.output_text or ""
+
+        # Extraction des tokens pour TOKENS_SINK
+        if TOKENS_SINK:
+            try:
+                usage_data = {
                     "meta": meta,
-                    **{k: int(u.get(k, 0)) for k in ("prompt_tokens", "completion_tokens", "total_tokens")},
+                    "prompt_tokens": getattr(r.usage, "input_tokens", 0) if hasattr(r, "usage") else 0,
+                    "completion_tokens": getattr(r.usage, "output_tokens", 0) if hasattr(r, "usage") else 0,
+                    "total_tokens": getattr(r.usage, "total_tokens", 0) if hasattr(r, "usage") else 0,
                 }
-            )
-        except Exception:
-            pass
-    return txt
-def call_ai_json(prompt: str, *, meta: Optional[str] = None) -> str:
-    """
-    Variante 'JSON strict' :
-    - température 0 pour réduire les sorties non conformes
-    - même modèle et même infra
-    """
-    r = client.chat.completions.create(
-        model=GPT_DEPLOYMENT,
-        messages=[
-            {"role": "system", "content": "Tu es un générateur JSON strict. Tu ne renvoies que du JSON valide."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.0,
-        max_tokens=30000,
-    )
-    txt = r.choices[0].message.content or ""
-    if TOKENS_SINK:
-        u = _extract_usage(r)
-        try:
-            TOKENS_SINK(
-                {
-                    "meta": meta,
-                    **{k: int(u.get(k, 0)) for k in ("prompt_tokens", "completion_tokens", "total_tokens")},
-                }
-            )
-        except Exception:
-            pass
+                TOKENS_SINK(usage_data)
+            except Exception:
+                pass
+    else:
+        # Ancienne API Chat Completions pour GPT-4.1
+        r = client.chat.completions.create(
+            model=GPT_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": "Tu es un expert du CIR/CII."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        txt = r.choices[0].message.content or ""
+
+        if TOKENS_SINK:
+            u = _extract_usage(r)
+            try:
+                TOKENS_SINK(
+                    {
+                        "meta": meta,
+                        **{k: int(u.get(k, 0)) for k in ("prompt_tokens", "completion_tokens", "total_tokens")},
+                    }
+                )
+            except Exception:
+                pass
+
     return txt
 
 # -------------------- RAG helpers --------------------
 def search_similar_chunks(query: str, index, chunks: List[str], vectors, top_k: int = 3):
-    """Retourne les chunks les plus proches de la requête (embedding + KNN)."""
     if not chunks or index is None:
         return []
     q = embed_texts([query])[0]
-    import numpy as np  # local import pour éviter le coût si inutilisé
+    import numpy as np
     q = np.array([q], dtype=np.float32).reshape(1, -1)
     actual_k = min(top_k, len(chunks))
     d, idx = index.kneighbors(q, n_neighbors=actual_k)
@@ -105,32 +124,37 @@ def _build(template: str, **kw) -> str:
     except Exception:
         return template or ""
 
+def _articles_list_str(articles: Optional[List[dict]]) -> str:
+    if not articles:
+        return "- Aucune référence sélectionnée."
+    lines: List[str] = []
+    for a in (articles or [])[:25]:
+        authors = (a.get("authors") or "?").strip()
+        year = a.get("year") or "?"
+        title = (a.get("title") or "").strip()
+        journal = (a.get("journal") or "").strip()
+        url = (a.get("url") or "").strip()
+        s = f"- {authors} ({year}). {title}" if title else f"- {authors} ({year})."
+        if journal:
+            s += f" — {journal}"
+        if url:
+            s += f" — {url}"
+        lines.append(s)
+    return "\n".join(lines) if lines else "- Aucune référence sélectionnée."
+
 # -------------------- Prompt Manager (Azure Blob) --------------------
 def _tmpl(name: str) -> str:
-    """
-    Mappe un identifiant logique -> nom de fichier dans le conteneur 'prompts'.
-    Les fichiers existent déjà dans ton blob (capture Azure) :
-      - bibliographie.txt
-      - contribution.txt
-      - entreprise.txt
-      - footnotes.txt
-      - gestion_recherche.txt
-      - indicateurs.txt
-      - objectifs.txt
-      - partenariat.txt
-      - prompt_contexte.txt
-      - ressources_humaines.txt
-      - resume.txt
-      - travaux.txt
-    """
     mapping = {
+        "objectif_unique": "objectif_unique.txt",  # NOUVEAU
+        "verrou_unique": "verrou_unique.txt",      # NOUVEAU
+
         "contexte": "prompt_contexte.txt",
         "indicateurs": "indicateurs.txt",
         "objectifs": "objectifs.txt",
         "travaux": "travaux.txt",
         "contribution": "contribution.txt",
         "partenariat": "partenariat.txt",
-        "verrou": "verrou.txt",  # si tu ajoutes le fichier au blob
+        "verrou": "verrou.txt",  # description longue du verrou
         "entreprise": "entreprise.txt",
         "gestion": "gestion_recherche.txt",
         "resume": "resume.txt",
@@ -139,130 +163,246 @@ def _tmpl(name: str) -> str:
         "footnotes": "footnotes.txt",
     }
     filename = mapping.get(name, f"{name}.txt")
-    return fetch_cir(filename)  # lit depuis le conteneur Azure 'prompts'
+    return fetch_cir(filename)
 
-def generate_section_with_rag(title, instruction, index, chunks, vectors) -> str:
-    ctx = "\n".join(search_similar_chunks(title or "section", index, chunks, vectors)) if index else ""
+def generate_section_with_rag(title: str, instruction: str, index, chunks, vectors, *, top_k: int = 3, temperature: float = 0.2) -> str:
+    ctx = "\n".join(search_similar_chunks(title or "section", index, chunks, vectors, top_k=top_k)) if index else ""
     prompt = f"""Rédige la section "{title}".
 Contexte:
 \"\"\"{ctx}\"\"\"
 Consignes:
 {instruction}
 """
-    return call_ai(prompt, meta=title)
+    return call_ai(prompt, meta=title, temperature=temperature)
 
-# Core/rag.py (extrait)
-from app.services.prompts import fetch_cii
-
-def _tmpl_cii(key: str) -> str:
-    mapping = {
-        "style": "style_guide.txt",
-        "presentation": "presentation_strat.txt",
-        "resume": "resume_scientifique.txt",
-        "contexte": "contexte_general.txt",
-        "analyse": "concurrence.txt",
-        "demarche": "demarche_experimentale.txt",
-        "resultats": "resultats.txt",
-        "rh_intro": "rh.txt",
-        "biblio_intro": "biblio.txt",
-    }
-    return fetch_cii(mapping.get(key, f"{key}.txt"))
-
-
-# -------------------- Génération de sections CIR --------------------
-def prompt_objectifs_filtre(objectif, verrou, annee, societe, articles: List[dict]) -> str:
-    tpl = _tmpl("objectifs")
-    lst = "\n".join([f"- {a.get('authors','?')} ({a.get('year','?')}). {a.get('title','')}" for a in articles or []])
-    return _build(
-        tpl,
-        objectif=objectif,
-        verrou=verrou,
+# -------------------- Génération CANONIQUE (objectif/verrou uniques) --------------------
+def generate_objectif_unique(index, chunks, vectors, *, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
+    """
+    Génère l'objectif canonique (stable) AVANT le reste.
+    Recommandé: température 0.
+    """
+    instruction = _build(
+        _tmpl("objectif_unique"),
         annee=annee,
         societe=societe,
-        liste_articles=lst,
+        liste_articles=_articles_list_str(articles),
+    )
+    txt = generate_section_with_rag(
+        "Objectif unique (canonique)",
+        instruction,
+        index, chunks, vectors,
+        top_k=5,
+        temperature=0.0,
+    )
+    return (txt or "").strip()
+
+def generate_verrou_unique(index, chunks, vectors, *, objectif_unique: str, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
+    """
+    Génère le verrou canonique (stable) APRÈS l'objectif.
+    Recommandé: température 0.
+    """
+    instruction = _build(
+        _tmpl("verrou_unique"),
+        objectif_unique=objectif_unique,
+        annee=annee,
+        societe=societe,
+        liste_articles=_articles_list_str(articles),
+    )
+    txt = generate_section_with_rag(
+        "Verrou unique (canonique)",
+        instruction,
+        index, chunks, vectors,
+        top_k=5,
+        temperature=0.0,
+    )
+    return (txt or "").strip()
+
+# -------------------- Sections CIR (toutes ancrées sur objectif_unique/verrou_unique) --------------------
+def prompt_objectifs_filtre(objectif_unique: str, verrou_unique: str, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
+    tpl = _tmpl("objectifs")
+    return _build(
+        tpl,
+        objectif_unique=objectif_unique,
+        verrou_unique=verrou_unique,
+        # compat si vos prompts utilisent encore objectif/verrou
+        objectif=objectif_unique,
+        verrou=verrou_unique,
+        annee=annee,
+        societe=societe,
+        liste_articles=_articles_list_str(articles),
         annee_debut=annee - 5,
         annee_fin=annee - 1,
     )
 
-def generate_contexte_section(i, c, v, obj, ver, an, soc):
-    return generate_section_with_rag(
-        "Contexte de l’opération de R&D",
-        _build(_tmpl("contexte"), objectif=obj, verrou=ver, annee=an, societe=soc),
-        i, c, v,
-    )
-
-def generate_indicateurs_section(i, c, v, obj, ver, an, soc):
-    return generate_section_with_rag(
-        "Indicateurs de R&D",
-        _build(_tmpl("indicateurs"), objectif=obj, verrou=ver, annee=an, societe=soc),
-        i, c, v,
-    )
-
-def generate_objectifs_section(i, c, v, obj, ver, an, soc, articles: List[dict] = []):
+def generate_objectifs_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
     return generate_section_with_rag(
         "Objet de l’opération de R&D",
-        prompt_objectifs_filtre(obj, ver, an, soc, articles),
-        i, c, v,
+        prompt_objectifs_filtre(objectif_unique, verrou_unique, annee, societe, articles),
+        index, chunks, vectors,
+        temperature=0.2,
     )
 
-def generate_travaux_section(i, c, v, obj, ver, an, soc):
+def generate_verrou_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
+    """
+    Description longue du verrou.
+    IMPORTANT: le prompt verrou.txt doit afficher verrou_unique à l'identique (copier-coller).
+    """
+    return generate_section_with_rag(
+        "Verrou technique (description)",
+        _build(
+            _tmpl("verrou"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            # compat
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+            liste_articles=_articles_list_str(articles),
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
+    )
+
+def generate_contexte_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
+    return generate_section_with_rag(
+        "Contexte de l’opération de R&D",
+        _build(
+            _tmpl("contexte"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            # compat
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+            liste_articles=_articles_list_str(articles),
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
+    )
+
+def generate_indicateurs_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str) -> str:
+    return generate_section_with_rag(
+        "Indicateurs de R&D",
+        _build(
+            _tmpl("indicateurs"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
+    )
+
+def generate_travaux_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str) -> str:
     return generate_section_with_rag(
         "Description de la démarche suivie et des travaux réalisés",
-        _build(_tmpl("travaux"), objectif=obj, verrou=ver, annee=an, societe=soc),
-        i, c, v,
+        _build(
+            _tmpl("travaux"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
     )
 
-def generate_contribution_section(i, c, v, obj, ver, an, soc):
+def generate_contribution_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str) -> str:
     return generate_section_with_rag(
         "Contribution scientifique, technique ou technologique",
-        _build(_tmpl("contribution"), objectif=obj, verrou=ver, annee=an, societe=soc),
-        i, c, v,
+        _build(
+            _tmpl("contribution"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
     )
 
-def generate_partenariat_section(i, c, v, obj, ver, an, soc):
+def generate_partenariat_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str) -> str:
     return generate_section_with_rag(
         "Partenariat scientifique et recherche confiée",
-        _build(_tmpl("partenariat"), objectif=obj, verrou=ver, annee=an, societe=soc),
-        i, c, v,
+        _build(
+            _tmpl("partenariat"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
     )
 
-def generate_entreprise_section(i, c, v, obj, ver, an, soc, style=None,site_web: str = ""):
+def generate_entreprise_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str, style=None, site_web: str = "") -> str:
     return generate_section_with_rag(
         "L’entreprise",
-        _build(_tmpl("entreprise"), objectif=obj, verrou=ver, annee=an, societe=soc, style=(style or ""), site_web=site_web or "(site non renseigné)"),
-        i, c, v,
+        _build(
+            _tmpl("entreprise"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+            style=(style or ""),
+            site_web=site_web or "(site non renseigné)",
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
     )
 
-def generate_gestion_recherche_section(i, c, v, obj, ver, an, soc):
+def generate_gestion_recherche_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str) -> str:
     return generate_section_with_rag(
         "Gestion de la recherche",
-        _build(_tmpl("gestion"), objectif=obj, verrou=ver, annee=an, societe=soc),
-        i, c, v,
+        _build(
+            _tmpl("gestion"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
     )
 
-def generate_resume_section(i, c, v, obj, ver, an, soc):
+def generate_resume_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
     return generate_section_with_rag(
         "Résumé scientifique de l’opération",
-        _build(_tmpl("resume"), objectif=obj, verrou=ver, annee=an, societe=soc),
-        i, c, v,
+        _build(
+            _tmpl("resume"),
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            objectif=objectif_unique,
+            verrou=verrou_unique,
+            annee=annee,
+            societe=societe,
+            liste_articles=_articles_list_str(articles),
+        ),
+        index, chunks, vectors,
+        temperature=0.2,
     )
 
-def generate_verrou_section(i, c, v, obj, ver, an, soc):
-    # Section "Verrou technique" (assure-toi d’avoir 'verrou.txt' dans le conteneur)
-    return generate_section_with_rag(
-        "Verrou technique",
-        _build(_tmpl("verrou"), objectif=obj, objet=obj, verrou=ver, annee=an, societe=soc),
-        i, c, v,
-    )
+# -------------------- Bibliographie, RH, evaluateur_travaux : gardez votre code existant --------------------
+# (Je ne le recopie pas ici pour éviter d'introduire des divergences non nécessaires.)
+
 
 # -------------------- Bibliographie & RH --------------------
-import re
-
 def _parse_authors(authors_raw: str):
-    """
-    Transforme 'M Arslan, H Ghanem, S Munawar' en liste [(NOM, Prénoms), ...].
-    Heuristique suffisante avec les auteurs Serper.
-    """
     if not authors_raw:
         return []
     tmp = authors_raw.replace(" and ", ",").replace(" et ", ",")
@@ -277,12 +417,10 @@ def _parse_authors(authors_raw: str):
         authors.append((surname, firstnames))
     return authors
 
-
 def _format_authors_iso(authors_raw: str) -> str:
     authors = _parse_authors(authors_raw or "")
     if not authors:
         return ""
-
     if len(authors) == 1:
         s, f = authors[0]
         return f"{s}, {f}" if f else s
@@ -290,31 +428,24 @@ def _format_authors_iso(authors_raw: str) -> str:
     formatted = []
     for (s, f) in authors[:3]:
         formatted.append(f"{s}, {f}" if f else s)
-
     if len(authors) > 3:
         formatted[-1] = formatted[-1] + ", et al."
-
     return "; ".join(formatted)
-
 
 def format_iso_690(a: dict) -> str:
     titre = (a.get("title") or "").strip()
     auteurs = (a.get("authors") or "").strip()
     journal = (a.get("journal") or "").strip()
 
-    # CAS 1 : article manuel "ISO 690 déjà prêt"
-    # - pas d'auteurs ni de journal,
-    # - mais un "titre" non vide (on l'interprète comme référence complète).
+    # Article manuel ISO déjà prêt
     if titre and not auteurs and not journal:
-        return titre  # on renvoie la chaîne telle quelle
+        return titre
 
-    # CAS 2 : article Serper / structuré -> on formate
     auteurs_iso = _format_authors_iso(auteurs)
     year = a.get("year") or "s.d."
     return f"{auteurs_iso}. {titre or 'Sans titre'}. {journal or 'Revue inconnue'}, {year}."
 
-
-def generate_biblio_section(articles: List[dict] = []) -> str:
+def generate_biblio_section(articles: Optional[List[dict]] = None) -> str:
     if not articles:
         return "Aucune référence sélectionnée."
 
@@ -326,7 +457,6 @@ def generate_biblio_section(articles: List[dict] = []) -> str:
         authors = (a.get("authors") or "").strip().lower()
         journal = (a.get("journal") or "").strip().lower()
 
-        # articles manuels ISO : pas d'auteurs / journal -> pas de dédoublonnage
         if not authors and not journal:
             uniq.append(a)
             continue
@@ -340,46 +470,79 @@ def generate_biblio_section(articles: List[dict] = []) -> str:
     uniq.sort(key=lambda x: (x.get("authors") or "").lower())
     return "\n".join(format_iso_690(x) for x in uniq)
 
-
 def generate_ressources_humaines_from_cvs(cv_texts: List[str]):
     ctx = "\n\n".join((cv_texts or [])[:5])
     prompt = f"""
-Tu reçois le contenu brut de CVs. Pour chaque personne, rends un JSON:
+Tu reçois le contenu brut de CVs. Pour chaque personne, extrais les informations REELLES trouvées dans les CVs.
 
-[{{"nom_prenom":"le nom en majuscule et le prenom","diplome":"son diplome le plus elevé","fonction":"son fonction dans l'operation ","contribution":"[À compléter par le client]","temps":"[À compléter par le client]"}}...]
+IMPORTANT: Ne génère PAS de placeholder comme "[À compléter par le client]".
+Si une information n'est PAS présente dans les CVs, utilise une chaîne vide "".
+
+Renvoie un JSON avec cette structure exacte (tableau de personnes):
+```json
+[
+  {{
+    "nom_prenom": "NOM Prénom réel du CV",
+    "diplome": "Diplôme le plus élevé trouvé dans le CV ou vide",
+    "fonction": "Fonction dans l'opération trouvée dans le CV ou vide",
+    "contribution": "Contribution décrite dans le CV ou vide",
+    "temps": "Temps/heures mentionné dans le CV ou vide"
+  }}
+]
+```
+
 CVs:
 \"\"\"{ctx}\"\"\"
+
+Renvoie UNIQUEMENT le JSON (tableau), sans texte avant ni après, sans markdown.
 """
     txt = call_ai(prompt, meta="Ressources humaines")
+
     try:
-        return json.loads(txt)
-    except Exception:
+        import re
+        # Nettoyer le texte retourné
+        cleaned = txt.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(?:json)?\s*\n', '', cleaned)
+            cleaned = re.sub(r'\n```\s*$', '', cleaned)
+
+        # Extraire le JSON
+        start = cleaned.find("[")
+        end = cleaned.rfind("]") + 1
+        if start != -1 and end > start:
+            json_str = cleaned[start:end]
+            personnel = json.loads(json_str)
+
+            # Nettoyer les valeurs "[À compléter par le client]"
+            for person in personnel:
+                for key in list(person.keys()):
+                    val = str(person.get(key, ""))
+                    if "[" in val and "compléter" in val.lower():
+                        person[key] = ""
+
+            return personnel
+        else:
+            raise ValueError("Pas de tableau JSON trouvé")
+
+    except Exception as e:
+        print(f"[RH CIR] Erreur parsing JSON: {e}")
+        print(f"[RH CIR] Contenu reçu: {txt[:200]}...")
         return [
             {
                 "nom_prenom": "Erreur parsing",
                 "diplome": "",
                 "fonction": "",
-                "contribution": txt,
+                "contribution": str(e),
                 "temps": "",
             }
         ]
 
-
 def evaluateur_travaux(texte: str, *, type_dossier: str = "CIR") -> str:
-    """
-    Insère des questions encadrées [[ROUGE: ...]] dans la section Travaux,
-    sans altérer le texte d’origine (sauf insertion des questions).
-
-    Le prompt est chargé depuis le Blob (evaluateur_travaux.txt dans PROMPTS_CONTAINER_OTHERS).
-    """
-    # Libellé de la section en fonction du type de dossier
     libelle = (
         "Description détaillée de la démarche scientifique suivie et des travaux réalisés"
         if type_dossier == "CIR"
         else "Description détaillée de la démarche expérimentale suivie et des travaux réalisés"
     )
-
-    # Récupération et formatage du template
     tpl = prompt_evaluateur_travaux()
     try:
         prompt = tpl.format(
@@ -392,23 +555,11 @@ def evaluateur_travaux(texte: str, *, type_dossier: str = "CIR") -> str:
 
     return call_ai(prompt, meta="Travaux avec questions")
 
-
-# Détection des questions de type "Pouvez-vous / Pourriez-vous ... ?"
-QUESTION_RE = re.compile(
-    r"(?is)\b(?:Pouvez|Pourriez)[\-\u2011\u2013 ]vous[^?]*\?"
-)
+QUESTION_RE = re.compile(r"(?is)\b(?:Pouvez|Pourriez)[\-\u2011\u2013 ]vous[^?]*\?")
 
 def wrap_questions_rouge(texte: str) -> str:
-    """
-    Encadre toutes les questions de type 'Pouvez-vous / Pourriez-vous ... ?'
-    avec [[ROUGE: ...]] si le texte ne contient pas déjà [[ROUGE:.
-    Sert de sécurité pour que les questions soient bien rouges même si le LLM
-    oublie le bon format.
-    """
     if not texte:
         return texte
-
-    # Si le LLM a déjà utilisé [[ROUGE: ...]], on ne touche à rien
     if "[[ROUGE:" in texte:
         return texte
 
@@ -419,40 +570,25 @@ def wrap_questions_rouge(texte: str) -> str:
         if start > pos:
             pieces.append(texte[pos:start])
         q = m.group(0)
-        # On encadre la question telle quelle
         pieces.append(f"[[ROUGE: {q} ]]")
         pos = end
 
     pieces.append(texte[pos:])
     return "".join(pieces)
 
-
-
 def enrich_manual_articles_iso(
     articles: List[dict],
     articles_texts: List[str],
 ) -> List[dict]:
-    """
-    Pour les articles ajoutés manuellement (ceux venant du front avec citations=0
-    et sans auteurs/journal/année), utilise l’IA sur le texte PDF correspondant
-    pour générer une référence ISO 690.
-
-    On suppose que l’ordre des articles_texts correspond à l’ordre des articles
-    manuels envoyés par le front.
-    """
     if not articles:
         return []
 
-    # On clone pour ne pas modifier l'entrée
     out: List[dict] = [dict(a) for a in articles]
+    manual_idxs = [
+        i for i, a in enumerate(out)
+        if not (a.get("authors") or "").strip() and int(a.get("citations") or 0) == 0
+    ]
 
-    # Heuristique pour détecter un article "manuel" :
-    # - pas d'auteurs
-    # - citations == 0
-    # - url éventuellement présente
-    manual_idxs = [i for i, a in enumerate(out) if not (a.get("authors") or "").strip() and int(a.get("citations") or 0) == 0]
-
-    # On parcourt les articles manuels et on mappe sur articles_texts par ordre
     txt_idx = 0
     for i in manual_idxs:
         if txt_idx >= len(articles_texts):
@@ -462,7 +598,6 @@ def enrich_manual_articles_iso(
         if not txt:
             continue
 
-        # On limite le texte pour l'IA (début de l'article suffit)
         snippet = txt[:4000]
 
         prompt = f"""
@@ -496,11 +631,9 @@ Format de réponse STRICT (JSON UTF-8) :
 
 Ne renvoie que le JSON, sans texte avant ni après.
 """
-
         try:
             raw = call_ai(prompt, meta="ISO690_manual_article")
             raw = (raw or "").strip()
-            # on sécurise: on cherche la plus grosse portion {...}
             start = raw.find("{")
             end = raw.rfind("}")
             json_str = raw[start : end + 1] if start != -1 and end != -1 else "{}"

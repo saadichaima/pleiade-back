@@ -8,6 +8,8 @@ load_dotenv()
 class Settings(BaseModel):
     # Azure OpenAI
     AZURE_OPENAI_KEY: str = os.getenv("AZURE_OPENAI_KEY", "")
+    AZURE_OPENAI_KEY52: str = os.getenv("AZURE_OPENAI_KEY52", "")
+
     AZURE_OPENAI_ENDPOINT: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
     AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
     AZURE_OPENAI_DEPLOYMENT: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")             # chat
@@ -38,9 +40,7 @@ class Settings(BaseModel):
 
     PROMPTS_BASE_URL: str = os.getenv("PROMPTS_BASE_URL", "")
 
-    # Docs templates (inchangé – doublon toléré)
-    TEMPLATE_CIR: str = os.getenv("TEMPLATE_CIR", "./Doc/MEMOIRE_CIR2.docx")
-    TEMPLATE_CII: str = os.getenv("TEMPLATE_CII", "./Doc/MEMOIRE_CII.docx")
+
 
     # ===== Cosmos DB =====
     COSMOS_URI: str = os.getenv("COSMOS_URI", "")
