@@ -87,7 +87,7 @@ def call_ai(prompt: str, *, meta: Optional[str] = None, temperature: float = 0.2
                 {"role": "user", "content": prompt},
             ],
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
         )
         txt = r.choices[0].message.content or ""
 
