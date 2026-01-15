@@ -16,7 +16,7 @@ def get_me(user: AppUser = Depends(get_current_user)):
 class NewUser(BaseModel):
     email: EmailStr
     name: str
-    role: Literal["admin", "consultant"]
+    role: Literal["admin", "consultant", "manager"]
     active: bool = True
 
 @router.get("/admin/users", response_model=list[AppUser])

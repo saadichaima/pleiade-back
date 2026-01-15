@@ -2,10 +2,9 @@
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import health, keywords, articles, generate, cii, auth_ms, history
+from app.routers import health, keywords, articles, generate, cii, auth_ms, history, admin_prompts, teams, admin_templates
 from fastapi.openapi.utils import get_openapi
 import json, os
-from app.routers import auth_ms, history
 
 
 openapi_tags = [
@@ -49,6 +48,9 @@ app.include_router(cii.router,      prefix="/cii", tags=["cii"])
 app.include_router(generate.router, prefix="/generate", tags=["generate"])
 app.include_router(auth_ms.router,  tags=["auth"])
 app.include_router(history.router,  tags=["history"])
+app.include_router(admin_prompts.router, tags=["admin"])
+app.include_router(admin_templates.router, tags=["admin"])
+app.include_router(teams.router, tags=["teams"])
 
 # debug: afficher les routes au démarrage
 @app.on_event("startup")
