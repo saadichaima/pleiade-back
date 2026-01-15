@@ -243,3 +243,23 @@ async def require_admin(user: AppUser = Depends(get_current_user)) -> AppUser:
             detail="Accès réservé aux administrateurs.",
         )
     return user
+
+
+async def require_manager(user: AppUser = Depends(get_current_user)) -> AppUser:
+    """Vérifie que l'utilisateur est un manager."""
+    if user.role != "manager":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Accès réservé aux managers.",
+        )
+    return user
+
+
+async def require_admin_or_manager(user: AppUser = Depends(get_current_user)) -> AppUser:
+    """Vérifie que l'utilisateur est admin OU manager."""
+    if user.role not in ["admin", "manager"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Accès réservé aux administrateurs et managers.",
+        )
+    return user
