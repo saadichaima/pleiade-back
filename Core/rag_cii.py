@@ -234,12 +234,75 @@ def gen_resume(
         performance_type=performance_type,
     )
     raw = generate_section_with_rag(
-        "Résumé scientifique de l’innovation",
+        "Résumé scientifique de l'innovation",
         instr,
         i, c, v,
     )
     return _normalize_md_lists(raw)
-    
+
+def gen_resume_from_sections(
+    sections: dict,
+    *,
+    projet: str,
+    annee: int,
+    period: str,
+    performance_type: str = "",
+) -> str:
+    """
+    Génère un résumé basé sur les sections déjà générées du document CII.
+    Garantit que le résumé reflète exactement le contenu du document final.
+    """
+    # Construire le contenu des sections pour le prompt
+    sections_content = ""
+
+    if sections.get("presentation"):
+        sections_content += f"\n\n=== PRÉSENTATION DE L'ENTREPRISE ===\n{sections['presentation']}"
+
+    if sections.get("contexte"):
+        sections_content += f"\n\n=== CONTEXTE DU PROJET ===\n{sections['contexte']}"
+
+    if sections.get("analyse"):
+        sections_content += f"\n\n=== ANALYSE CONCURRENTIELLE ===\n{sections['analyse']}"
+
+    if sections.get("performances"):
+        sections_content += f"\n\n=== PERFORMANCES VISÉES ===\n{sections['performances']}"
+
+    if sections.get("demarche"):
+        sections_content += f"\n\n=== DÉMARCHE ET TRAVAUX ===\n{sections['demarche']}"
+
+    if sections.get("resultats"):
+        sections_content += f"\n\n=== RÉSULTATS OBTENUS ===\n{sections['resultats']}"
+
+    if sections.get("rh_intro"):
+        sections_content += f"\n\n=== RESSOURCES HUMAINES ===\n{sections['rh_intro']}"
+
+    # Prompt pour générer le résumé à partir des sections
+    prompt = f"""Tu es un expert CII (Crédit d'Impôt Innovation). Tu dois rédiger un résumé scientifique synthétique du projet d'innovation.
+
+**IMPORTANT**: Ce résumé doit être une synthèse FIDÈLE des sections déjà rédigées ci-dessous. Ne pas inventer de nouvelles informations, mais condenser ce qui est présent.
+
+SECTIONS DU DOCUMENT :
+{sections_content}
+
+INFORMATIONS COMPLÉMENTAIRES :
+- Projet : {projet}
+- Année : {annee}
+- Période : {period}
+- Type de performance : {performance_type}
+
+INSTRUCTIONS :
+1. Rédige un résumé de 250-400 mots qui synthétise l'ensemble du projet d'innovation
+2. Structure : présentation brève → contexte → objectif d'innovation → démarche → résultats
+3. Reste fidèle au contenu des sections (ne pas ajouter d'informations non présentes)
+4. Utilise un style scientifique et professionnel adapté au CII
+5. Mets en avant le caractère innovant et les performances du prototype
+6. Évite les répétitions inutiles
+
+Rédige maintenant le résumé scientifique :"""
+
+    raw = call_ai(prompt, meta="resume_cii_from_sections", temperature=0.3)
+    return _normalize_md_lists(raw)
+
 
 def gen_contexte(
     i,

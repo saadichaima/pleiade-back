@@ -48,15 +48,6 @@ def build_sections_cii(
         performance_type=performance_type,
     )
 
-
-    resume = rag_cii.gen_resume(
-        i, c, v,
-        projet=info.projet_name,
-        annee=info.annee,
-        period=period,
-        performance_type=performance_type,
-    )
-
     contexte = rag_cii.gen_contexte(
         im, cm, vm,
         annee=info.annee,
@@ -139,6 +130,23 @@ def build_sections_cii(
     )
 
     biblio_intro = rag_cii.get_biblio_intro()
+
+    # Générer le résumé en se basant sur les sections déjà générées
+    resume = rag_cii.gen_resume_from_sections(
+        sections={
+            "presentation": presentation,
+            "contexte": contexte,
+            "analyse": analyse,
+            "performances": performances,
+            "demarche": demarche,
+            "resultats": resultats,
+            "rh_intro": rh_intro,
+        },
+        projet=info.projet_name,
+        annee=info.annee,
+        period=period,
+        performance_type=performance_type,
+    )
 
     return {
         "presentation": presentation,    # 👉 d.cii.presentation

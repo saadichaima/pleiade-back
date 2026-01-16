@@ -160,8 +160,19 @@ def build_sections_cir(
         societe=societe,
     )
 
-    resume = rag.generate_resume_section(
-        index_mix, chunks_mix, vectors_mix,
+    # Générer le résumé en se basant sur les sections déjà générées
+    resume = rag.generate_resume_from_sections(
+        sections={
+            "entreprise": entreprise,
+            "contexte": contexte,
+            "objectifs": objet,
+            "verrous": section_verrou,
+            "travaux": travaux,
+            "contribution": contribution,
+            "indicateurs": indicateurs,
+            "partenariat": partenariat,
+            "gestion": gestion,
+        },
         objectif_unique=objectif_unique,
         verrou_unique=verrou_unique,
         annee=annee,

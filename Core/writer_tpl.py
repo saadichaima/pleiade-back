@@ -12,6 +12,8 @@
 from docx import Document as DocxDocument
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt, RGBColor
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 import re
 
 DEFAULT_FONT = "Times New Roman"
@@ -114,6 +116,57 @@ def _apply_first_existing_style(paragraph, candidates) -> bool:
     return False
 
 
+def _ensure_bullet_numbering(doc):
+    """
+    S'assure qu'une définition de numérotation pour puces existe dans le document.
+    Retourne le numId à utiliser.
+    """
+    # Vérifier si numbering.xml existe
+    try:
+        numbering_part = doc.part.numbering_part
+        if numbering_part is None:
+            # Créer numbering part si absent
+            from docx.opc.constants import RELATIONSHIP_TYPE as RT
+            from docx.opc.part import XmlPart
+            numbering_part = doc.part.relate_to(
+                XmlPart.load(doc.part.package, RT.NUMBERING, None),
+                RT.NUMBERING
+            )
+    except Exception:
+        pass
+
+    # Retourner 1 par défaut (devrait exister dans la plupart des templates Word)
+    return 1
+
+
+def _apply_list_numbering(paragraph, ilvl=0, numId=1):
+    """
+    Applique manuellement la numérotation de liste à un paragraphe.
+    ilvl: niveau de liste (0=niveau 1, 1=niveau 2)
+    numId: identifiant de la numérotation (1 pour puces)
+    """
+    pPr = paragraph._p.get_or_add_pPr()
+
+    # Supprimer numPr existant si présent
+    for child in pPr:
+        if child.tag.endswith('numPr'):
+            pPr.remove(child)
+
+    numPr = OxmlElement('w:numPr')
+
+    # Niveau de liste
+    ilvl_element = OxmlElement('w:ilvl')
+    ilvl_element.set(qn('w:val'), str(ilvl))
+    numPr.append(ilvl_element)
+
+    # ID de numérotation
+    numId_element = OxmlElement('w:numId')
+    numId_element.set(qn('w:val'), str(numId))
+    numPr.append(numId_element)
+
+    pPr.append(numPr)
+
+
 def _normalize_inline_lists(text: str) -> str:
     """
     Transforme les items de niveau 2 collés sur une ligne :
@@ -185,6 +238,10 @@ def format_docx(path: str):
     order_re = re.compile(r"^(?P<num>\d+)[\.)]\s+(?P<txt>.+)$")
     bullet_lvl1_re = re.compile(r"^[\-\u2010\u2011\u2012\u2013\u2014\*]\s+(?P<txt>.+)$")
     bullet_lvl2_re = re.compile(r"^[/／]\s+(?P<txt>.+)$")
+    # Chiffres romains (I, II, III, IV, V, VI, etc.) → niveau 1
+    roman_re = re.compile(r"^(?P<num>[IVXLCDM]+)[\.)]\s+(?P<txt>.+)$", re.IGNORECASE)
+    # Lettres (a, b, c, etc.) → niveau 2
+    letter_re = re.compile(r"^(?P<letter>[a-z])[\.)]\s+(?P<txt>.+)$", re.IGNORECASE)
 
     def _insert_paragraph_after(par: Paragraph) -> Paragraph:
         """
@@ -250,8 +307,12 @@ def format_docx(path: str):
         nonlocal in_lvl2_block, last_lvl2_par
         if in_lvl2_block and last_lvl2_par is not None:
             # dernier item lvl2 => ponctuation finale "."
+            # Chercher dans tous les runs (pas seulement le dernier car il y a la puce)
             for r in reversed(last_lvl2_par.runs):
                 t = r.text or ""
+                # Ignorer les runs qui sont juste des puces
+                if t.strip() in ["•", "○", "•\t", "○\t"]:
+                    continue
                 idx = t.rfind(";")
                 if idx != -1:
                     r.text = t[:idx] + "." + t[idx + 1 :]
@@ -283,22 +344,68 @@ def format_docx(path: str):
         m_lvl2 = bullet_lvl2_re.match(stripped)
         m_lvl1 = bullet_lvl1_re.match(stripped)
         m_ord = order_re.match(stripped)
+        m_roman = roman_re.match(stripped)
+        m_letter = letter_re.match(stripped)
 
         is_list_item = False
         pf = p.paragraph_format
         pf.line_spacing = 1.15
 
 
-        if m_lvl2:
+        # Lettres (a, b, c) → puces niveau 2
+        if m_letter:
+            content = _collapse_spaces(m_letter.group("txt")).rstrip(" ;.")
+            p.clear()
+            # Ajouter le symbole de puce circulaire directement
+            bullet_run = p.add_run("○\t")
+            bullet_run.font.name = "Symbol"
+            bullet_run.font.size = Pt(11)
+            # Ajouter le contenu
+            content_run = p.add_run(f"{content};")
+            content_run.font.name = DEFAULT_FONT
+            content_run.font.size = Pt(11)
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            # Indentation pour niveau 2
+            pf.left_indent = Pt(36)  # 0.5 pouces
+            pf.first_line_indent = Pt(-18)  # hanging indent
+            in_lvl2_block = True
+            last_lvl2_par = p
+            is_list_item = True
+
+        # Chiffres romains (I, II, III) → puces niveau 1
+        elif m_roman:
+            close_lvl2_block()
+            content = _collapse_spaces(m_roman.group("txt"))
+            p.clear()
+            # Ajouter le symbole de puce pleine directement
+            bullet_run = p.add_run("•\t")
+            bullet_run.font.name = "Symbol"
+            bullet_run.font.size = Pt(11)
+            # Ajouter le contenu
+            content_run = p.add_run(content)
+            content_run.font.name = DEFAULT_FONT
+            content_run.font.size = Pt(11)
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            # Indentation pour niveau 1
+            pf.left_indent = Pt(18)  # 0.25 pouces
+            pf.first_line_indent = Pt(-18)  # hanging indent
+            is_list_item = True
+
+        elif m_lvl2:
             content = _collapse_spaces(m_lvl2.group("txt")).rstrip(" ;.")
             p.clear()
-            run = p.add_run(f"{content};")
-            run.font.name = DEFAULT_FONT
-            _apply_first_existing_style(
-                p,
-                ["List Bullet 2", "Liste à puces 2", "List Paragraph", "Paragraphe de liste"],
-            )
+            # Ajouter le symbole de puce circulaire directement
+            bullet_run = p.add_run("○\t")
+            bullet_run.font.name = "Symbol"
+            bullet_run.font.size = Pt(11)
+            # Ajouter le contenu
+            content_run = p.add_run(f"{content};")
+            content_run.font.name = DEFAULT_FONT
+            content_run.font.size = Pt(11)
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            # Indentation pour niveau 2
+            pf.left_indent = Pt(36)  # 0.5 pouces
+            pf.first_line_indent = Pt(-18)  # hanging indent
             in_lvl2_block = True
             last_lvl2_par = p
             is_list_item = True
@@ -307,13 +414,18 @@ def format_docx(path: str):
             close_lvl2_block()
             content = _collapse_spaces(m_lvl1.group("txt"))
             p.clear()
-            run = p.add_run(content)
-            run.font.name = DEFAULT_FONT
-            _apply_first_existing_style(
-                p,
-                ["List Bullet", "Liste à puces", "List Paragraph", "Paragraphe de liste"],
-            )
+            # Ajouter le symbole de puce pleine directement
+            bullet_run = p.add_run("•\t")
+            bullet_run.font.name = "Symbol"
+            bullet_run.font.size = Pt(11)
+            # Ajouter le contenu
+            content_run = p.add_run(content)
+            content_run.font.name = DEFAULT_FONT
+            content_run.font.size = Pt(11)
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            # Indentation pour niveau 1
+            pf.left_indent = Pt(18)  # 0.25 pouces
+            pf.first_line_indent = Pt(-18)  # hanging indent
             is_list_item = True
 
         elif m_ord:
@@ -322,6 +434,7 @@ def format_docx(path: str):
             p.clear()
             run = p.add_run(content)
             run.font.name = DEFAULT_FONT
+            run.font.size = Pt(11)
             _apply_first_existing_style(
                 p,
                 ["List Number", "Liste numérotée", "List Paragraph", "Paragraphe de liste"],

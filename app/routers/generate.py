@@ -21,6 +21,7 @@ from app.models.schemas import GenerateRequest
 from app.services.builder import build_rag_indexes, build_sections_cir
 from app.services.builder_cii import build_sections_cii
 from app.services.figures_planner import prepare_figures_for_cir, prepare_figures_for_cii
+from app.services.web_scraper import extract_website_context
 
 from app.services.cosmos_client import get_projects_container, get_outputs_container
 from app.services.blob_client import upload_bytes_to_blob
@@ -155,6 +156,10 @@ def _generate_docx_sync(
         text_client += "\n" + document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
     for d in docs_admin_data:
         text_admin += "\n" + document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
+
+    # Enrichir avec le site web si nécessaire (docs admin insuffisants)
+    site_web = info.site_web or ""
+    text_admin = extract_website_context(site_web, text_admin, min_words=500)
 
     # 2) Build RAG
     emit("rag_index", "Construction des index de recherche (RAG)", 25)

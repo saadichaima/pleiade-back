@@ -382,7 +382,7 @@ def generate_gestion_recherche_section(index, chunks, vectors, *, objectif_uniqu
 
 def generate_resume_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
     return generate_section_with_rag(
-        "Résumé scientifique de l’opération",
+        "Résumé scientifique de l'opération",
         _build(
             _tmpl("resume"),
             objectif_unique=objectif_unique,
@@ -396,6 +396,68 @@ def generate_resume_section(index, chunks, vectors, *, objectif_unique: str, ver
         index, chunks, vectors,
         temperature=0.2,
     )
+
+def generate_resume_from_sections(sections: dict, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str, articles: Optional[List[dict]] = None) -> str:
+    """
+    Génère un résumé basé sur les sections déjà générées du document CIR.
+    Garantit que le résumé reflète exactement le contenu du document final.
+    """
+    # Construire le contenu des sections pour le prompt
+    sections_content = ""
+
+    if sections.get("entreprise"):
+        sections_content += f"\n\n=== PRÉSENTATION DE L'ENTREPRISE ===\n{sections['entreprise']}"
+
+    if sections.get("contexte"):
+        sections_content += f"\n\n=== CONTEXTE ===\n{sections['contexte']}"
+
+    if sections.get("objectifs"):
+        sections_content += f"\n\n=== OBJECTIFS ===\n{sections['objectifs']}"
+
+    if sections.get("verrous"):
+        sections_content += f"\n\n=== VERROUS SCIENTIFIQUES ET TECHNIQUES ===\n{sections['verrous']}"
+
+    if sections.get("travaux"):
+        sections_content += f"\n\n=== TRAVAUX RÉALISÉS ===\n{sections['travaux']}"
+
+    if sections.get("contribution"):
+        sections_content += f"\n\n=== CONTRIBUTION SCIENTIFIQUE ===\n{sections['contribution']}"
+
+    if sections.get("indicateurs"):
+        sections_content += f"\n\n=== INDICATEURS ===\n{sections['indicateurs']}"
+
+    if sections.get("partenariat"):
+        sections_content += f"\n\n=== PARTENARIATS ===\n{sections['partenariat']}"
+
+    if sections.get("gestion"):
+        sections_content += f"\n\n=== GESTION DE LA RECHERCHE ===\n{sections['gestion']}"
+
+    # Prompt pour générer le résumé à partir des sections
+    prompt = f"""Tu es un expert CIR. Tu dois rédiger un résumé scientifique synthétique du projet de R&D.
+
+**IMPORTANT**: Ce résumé doit être une synthèse FIDÈLE des sections déjà rédigées ci-dessous. Ne pas inventer de nouvelles informations, mais condenser ce qui est présent.
+
+SECTIONS DU DOCUMENT :
+{sections_content}
+
+INFORMATIONS COMPLÉMENTAIRES :
+- Entreprise : {societe}
+- Année : {annee}
+- Objectif principal : {objectif_unique}
+- Verrou principal : {verrou_unique}
+- Articles scientifiques : {_articles_list_str(articles)}
+
+INSTRUCTIONS :
+1. Rédige un résumé de 300-500 mots qui synthétise l'ensemble du projet
+2. Structure : présentation brève de l'entreprise → contexte → objectifs → verrous → travaux → résultats/contributions
+3. Reste fidèle au contenu des sections (ne pas ajouter d'informations non présentes)
+4. Utilise un style scientifique et professionnel
+5. Évite les répétitions inutiles
+6. Mets en avant la démarche R&D et les innovations
+
+Rédige maintenant le résumé scientifique :"""
+
+    return call_ai(prompt, meta="resume_from_sections", temperature=0.3)
 
 # -------------------- Bibliographie, RH, evaluateur_travaux : gardez votre code existant --------------------
 # (Je ne le recopie pas ici pour éviter d'introduire des divergences non nécessaires.)
