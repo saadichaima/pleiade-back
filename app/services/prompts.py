@@ -155,3 +155,31 @@ def prompt_footnotes_glossary() -> str:
             "Prompt 'footnotes_glossary.txt' introuvable dans le Blob (conteneur PROMPTS_CONTAINER_OTHERS)."
         )
     return txt
+
+def prompt_cir_resume() -> str:
+    """
+    Prompt utilisé par Core.rag.generate_resume_from_sections pour générer
+    le résumé scientifique du document CIR à partir des sections.
+
+    Fichier attendu dans PROMPTS_CONTAINER_CIR : 'resume.txt'.
+    """
+    txt = fetch_cir("resume.txt")
+    if not txt:
+        raise RuntimeError(
+            "Prompt 'resume.txt' introuvable dans le Blob (conteneur PROMPTS_CONTAINER_CIR)."
+        )
+    return txt
+
+def prompt_cii_resume() -> str:
+    """
+    Prompt utilisé par Core.rag_cii.gen_resume_from_sections pour générer
+    le résumé scientifique du document CII à partir des sections.
+
+    Fichier attendu dans PROMPTS_CONTAINER_CII : 'resume_scientifique.txt'.
+    """
+    txt = fetch_cii("resume_scientifique.txt")
+    if not txt:
+        raise RuntimeError(
+            "Prompt 'resume_scientifique.txt' introuvable dans le Blob (conteneur PROMPTS_CONTAINER_CII)."
+        )
+    return txt

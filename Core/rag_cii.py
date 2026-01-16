@@ -252,6 +252,8 @@ def gen_resume_from_sections(
     Génère un résumé basé sur les sections déjà générées du document CII.
     Garantit que le résumé reflète exactement le contenu du document final.
     """
+    from app.services.prompts import prompt_cii_resume
+
     # Construire le contenu des sections pour le prompt
     sections_content = ""
 
@@ -276,29 +278,17 @@ def gen_resume_from_sections(
     if sections.get("rh_intro"):
         sections_content += f"\n\n=== RESSOURCES HUMAINES ===\n{sections['rh_intro']}"
 
-    # Prompt pour générer le résumé à partir des sections
-    prompt = f"""Tu es un expert CII (Crédit d'Impôt Innovation). Tu dois rédiger un résumé scientifique synthétique du projet d'innovation.
+    # Récupérer le template du prompt depuis le blob
+    prompt_template = prompt_cii_resume()
 
-**IMPORTANT**: Ce résumé doit être une synthèse FIDÈLE des sections déjà rédigées ci-dessous. Ne pas inventer de nouvelles informations, mais condenser ce qui est présent.
-
-SECTIONS DU DOCUMENT :
-{sections_content}
-
-INFORMATIONS COMPLÉMENTAIRES :
-- Projet : {projet}
-- Année : {annee}
-- Période : {period}
-- Type de performance : {performance_type}
-
-INSTRUCTIONS :
-1. Rédige un résumé de 250-400 mots qui synthétise l'ensemble du projet d'innovation
-2. Structure : présentation brève → contexte → objectif d'innovation → démarche → résultats
-3. Reste fidèle au contenu des sections (ne pas ajouter d'informations non présentes)
-4. Utilise un style scientifique et professionnel adapté au CII
-5. Mets en avant le caractère innovant et les performances du prototype
-6. Évite les répétitions inutiles
-
-Rédige maintenant le résumé scientifique :"""
+    # Remplacer les variables dans le prompt
+    prompt = prompt_template.format(
+        sections_content=sections_content,
+        projet=projet,
+        annee=annee,
+        period=period,
+        performance_type=performance_type
+    )
 
     raw = call_ai(prompt, meta="resume_cii_from_sections", temperature=0.3)
     return _normalize_md_lists(raw)

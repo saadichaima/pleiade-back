@@ -402,6 +402,8 @@ def generate_resume_from_sections(sections: dict, *, objectif_unique: str, verro
     Génère un résumé basé sur les sections déjà générées du document CIR.
     Garantit que le résumé reflète exactement le contenu du document final.
     """
+    from app.services.prompts import prompt_cir_resume
+
     # Construire le contenu des sections pour le prompt
     sections_content = ""
 
@@ -432,30 +434,18 @@ def generate_resume_from_sections(sections: dict, *, objectif_unique: str, verro
     if sections.get("gestion"):
         sections_content += f"\n\n=== GESTION DE LA RECHERCHE ===\n{sections['gestion']}"
 
-    # Prompt pour générer le résumé à partir des sections
-    prompt = f"""Tu es un expert CIR. Tu dois rédiger un résumé scientifique synthétique du projet de R&D.
+    # Récupérer le template du prompt depuis le blob
+    prompt_template = prompt_cir_resume()
 
-**IMPORTANT**: Ce résumé doit être une synthèse FIDÈLE des sections déjà rédigées ci-dessous. Ne pas inventer de nouvelles informations, mais condenser ce qui est présent.
-
-SECTIONS DU DOCUMENT :
-{sections_content}
-
-INFORMATIONS COMPLÉMENTAIRES :
-- Entreprise : {societe}
-- Année : {annee}
-- Objectif principal : {objectif_unique}
-- Verrou principal : {verrou_unique}
-- Articles scientifiques : {_articles_list_str(articles)}
-
-INSTRUCTIONS :
-1. Rédige un résumé de 300-500 mots qui synthétise l'ensemble du projet
-2. Structure : présentation brève de l'entreprise → contexte → objectifs → verrous → travaux → résultats/contributions
-3. Reste fidèle au contenu des sections (ne pas ajouter d'informations non présentes)
-4. Utilise un style scientifique et professionnel
-5. Évite les répétitions inutiles
-6. Mets en avant la démarche R&D et les innovations
-
-Rédige maintenant le résumé scientifique :"""
+    # Remplacer les variables dans le prompt
+    prompt = prompt_template.format(
+        sections_content=sections_content,
+        societe=societe,
+        annee=annee,
+        objectif_unique=objectif_unique,
+        verrou_unique=verrou_unique,
+        articles=_articles_list_str(articles)
+    )
 
     return call_ai(prompt, meta="resume_from_sections", temperature=0.3)
 
