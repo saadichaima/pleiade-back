@@ -39,6 +39,10 @@ def build_sections_cir(
     doc_complete: bool,
     externalises: bool,
 ):
+    import time
+    total_start = time.time()
+    print(f"[CIR-BUILD] Debut generation des sections CIR pour {societe} ({annee})")
+
     (index_client, chunks_client, vectors_client) = index_client_pack
     (index_mix, chunks_mix, vectors_mix) = index_mix_pack
     (index_adm, chunks_adm, vectors_adm) = index_admin_pack
@@ -51,6 +55,8 @@ def build_sections_cir(
     idx_obj, chunks_obj, vecs_obj = merge_rag_packs(index_client_pack, index_articles_pack)
 
     # 1) OBJECTIF UNIQUE (canonique)
+    print("[CIR-BUILD] 1/12 Generation objectif_unique...")
+    step_start = time.time()
     objectif_unique = (objectif or "").strip()
     if not objectif_unique:
         objectif_unique = rag.generate_objectif_unique(
@@ -59,8 +65,11 @@ def build_sections_cir(
             societe=societe,
             articles=articles,
         )
+    print(f"[CIR-BUILD] 1/12 objectif_unique OK en {time.time() - step_start:.1f}s")
 
     # 2) VERROU UNIQUE (canonique)
+    print("[CIR-BUILD] 2/12 Generation verrou_unique...")
+    step_start = time.time()
     verrou_unique = (verrou or "").strip()
     if not verrou_unique:
         verrou_unique = rag.generate_verrou_unique(
@@ -70,8 +79,11 @@ def build_sections_cir(
             societe=societe,
             articles=articles,
         )
+    print(f"[CIR-BUILD] 2/12 verrou_unique OK en {time.time() - step_start:.1f}s")
 
     # 3) OBJET (section détaillée) – ancrée par objectif_unique/verrou_unique
+    print("[CIR-BUILD] 3/12 Generation section objet...")
+    step_start = time.time()
     objet = rag.generate_objectifs_section(
         idx_obj, chunks_obj, vecs_obj,
         objectif_unique=objectif_unique,
@@ -80,8 +92,11 @@ def build_sections_cir(
         societe=societe,
         articles=articles,
     )
+    print(f"[CIR-BUILD] 3/12 objet OK en {time.time() - step_start:.1f}s")
 
     # 4) SECTION VERROU (description longue) – MAIS elle doit reprendre la question canonique à l'identique
+    print("[CIR-BUILD] 4/12 Generation section verrou...")
+    step_start = time.time()
     section_verrou = rag.generate_verrou_section(
         idx_obj, chunks_obj, vecs_obj,
         objectif_unique=objectif_unique,
@@ -90,8 +105,11 @@ def build_sections_cir(
         societe=societe,
         articles=articles,
     )
+    print(f"[CIR-BUILD] 4/12 verrou OK en {time.time() - step_start:.1f}s")
 
     # 5) Les autres sections utilisent exactement objectif_unique + verrou_unique
+    print("[CIR-BUILD] 5/12 Generation section contexte...")
+    step_start = time.time()
     contexte = rag.generate_contexte_section(
         idx_obj, chunks_obj, vecs_obj,
         objectif_unique=objectif_unique,
@@ -100,7 +118,10 @@ def build_sections_cir(
         societe=societe,
         articles=articles,
     )
+    print(f"[CIR-BUILD] 5/12 contexte OK en {time.time() - step_start:.1f}s")
 
+    print("[CIR-BUILD] 6/12 Generation section indicateurs...")
+    step_start = time.time()
     indicateurs = rag.generate_indicateurs_section(
         index_mix, chunks_mix, vectors_mix,
         objectif_unique=objectif_unique,
@@ -108,7 +129,10 @@ def build_sections_cir(
         annee=annee,
         societe=societe,
     )
+    print(f"[CIR-BUILD] 6/12 indicateurs OK en {time.time() - step_start:.1f}s")
 
+    print("[CIR-BUILD] 7/12 Generation section travaux...")
+    step_start = time.time()
     travaux = rag.generate_travaux_section(
         index_client, chunks_client, vectors_client,
         objectif_unique=objectif_unique,
@@ -117,8 +141,12 @@ def build_sections_cir(
         societe=societe,
     )
     if not doc_complete:
+        print("[CIR-BUILD] 7/12 Evaluation travaux (doc incomplete)...")
         travaux = rag.evaluateur_travaux(travaux)
+    print(f"[CIR-BUILD] 7/12 travaux OK en {time.time() - step_start:.1f}s")
 
+    print("[CIR-BUILD] 8/12 Generation section contribution...")
+    step_start = time.time()
     contribution = rag.generate_contribution_section(
         index_client, chunks_client, vectors_client,
         objectif_unique=objectif_unique,
@@ -126,9 +154,15 @@ def build_sections_cir(
         annee=annee,
         societe=societe,
     )
+    print(f"[CIR-BUILD] 8/12 contribution OK en {time.time() - step_start:.1f}s")
 
+    print("[CIR-BUILD] 9/12 Generation section biblio...")
+    step_start = time.time()
     biblio = rag.generate_biblio_section(articles)
+    print(f"[CIR-BUILD] 9/12 biblio OK en {time.time() - step_start:.1f}s")
 
+    print("[CIR-BUILD] 10/12 Generation section partenariat...")
+    step_start = time.time()
     partenariat = "Rien à déclarer." if not externalises else rag.generate_partenariat_section(
         index_mix, chunks_mix, vectors_mix,
         objectif_unique=objectif_unique,
@@ -136,12 +170,15 @@ def build_sections_cir(
         annee=annee,
         societe=societe,
     )
+    print(f"[CIR-BUILD] 10/12 partenariat OK en {time.time() - step_start:.1f}s")
 
     # entreprise: priorité docs admin
     ent_index  = index_adm or index_mix
     ent_chunks = chunks_adm or chunks_mix
     ent_vecs   = vectors_adm or vectors_mix
 
+    print("[CIR-BUILD] 11/12 Generation section entreprise...")
+    step_start = time.time()
     entreprise = rag.generate_entreprise_section(
         ent_index, ent_chunks, ent_vecs,
         objectif_unique=objectif_unique,
@@ -151,7 +188,10 @@ def build_sections_cir(
         style=None,
         site_web=site_web,
     )
+    print(f"[CIR-BUILD] 11/12 entreprise OK en {time.time() - step_start:.1f}s")
 
+    print("[CIR-BUILD] 12/12 Generation section gestion...")
+    step_start = time.time()
     gestion = rag.generate_gestion_recherche_section(
         index_mix, chunks_mix, vectors_mix,
         objectif_unique=objectif_unique,
@@ -159,8 +199,11 @@ def build_sections_cir(
         annee=annee,
         societe=societe,
     )
+    print(f"[CIR-BUILD] 12/12 gestion OK en {time.time() - step_start:.1f}s")
 
     # Générer le résumé en se basant sur les sections déjà générées
+    print("[CIR-BUILD] FINAL Generation resume...")
+    step_start = time.time()
     resume = rag.generate_resume_from_sections(
         sections={
             "entreprise": entreprise,
@@ -179,6 +222,10 @@ def build_sections_cir(
         societe=societe,
         articles=articles,
     )
+    print(f"[CIR-BUILD] FINAL resume OK en {time.time() - step_start:.1f}s")
+
+    total_elapsed = time.time() - total_start
+    print(f"[CIR-BUILD] TERMINE - Toutes les sections generees en {total_elapsed:.1f}s")
 
     return {
         # variables canoniques (à injecter partout, et éventuellement dans le template)

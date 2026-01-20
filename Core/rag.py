@@ -15,6 +15,9 @@ load_dotenv()
 API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "")
 USE_RESPONSES_API = API_VERSION.startswith("2025-") or "2025" in API_VERSION
 
+# Timeout pour les appels LLM (en secondes)
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))  # 2 minutes par defaut
+
 if USE_RESPONSES_API:
     # Nouvelle API Responses pour GPT-5.2
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
@@ -26,15 +29,17 @@ if USE_RESPONSES_API:
     client = OpenAI(
         api_key=os.getenv("AZURE_OPENAI_KEY"),
         base_url=base_url,
+        timeout=LLM_TIMEOUT,
     )
 
-    print(f"[DEBUG] Client type: {type(client)}, has responses: {hasattr(client, 'responses')}")
+    print(f"[DEBUG] Client type: {type(client)}, has responses: {hasattr(client, 'responses')}, timeout: {LLM_TIMEOUT}s")
 else:
     # Ancienne API Chat Completions pour GPT-4.1
     client = AzureOpenAI(
         api_key=os.getenv("AZURE_OPENAI_KEY"),
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_version=API_VERSION,
+        timeout=LLM_TIMEOUT,
     )
 
 GPT_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
@@ -52,58 +57,71 @@ def _extract_usage(resp):
     except Exception:
         return {}
 
-def call_ai(prompt: str, *, meta: Optional[str] = None, temperature: float = 0.2, max_tokens: int = 30000) -> str:
-    if USE_RESPONSES_API:
-        # Nouvelle API Responses pour GPT-5.2
-        # Note: GPT-5.2 ne supporte pas le paramètre temperature
-        r = client.responses.create(
-            model=GPT_DEPLOYMENT,
-            input=[
-                {"role": "system", "content": "Tu es un expert du CIR/CII."},
-                {"role": "user", "content": prompt},
-            ],
-            max_output_tokens=max_tokens,
-        )
-        txt = r.output_text or ""
+def call_ai(prompt: str, *, meta: Optional[str] = None, temperature: float = 0.2, max_tokens: int = 40000) -> str:
+    import time
+    start_time = time.time()
+    prompt_len = len(prompt)
+    print(f"[CALL_AI] Debut appel LLM - meta={meta}, prompt={prompt_len} chars, max_tokens={max_tokens}")
 
-        # Extraction des tokens pour TOKENS_SINK
-        if TOKENS_SINK:
-            try:
-                usage_data = {
-                    "meta": meta,
-                    "prompt_tokens": getattr(r.usage, "input_tokens", 0) if hasattr(r, "usage") else 0,
-                    "completion_tokens": getattr(r.usage, "output_tokens", 0) if hasattr(r, "usage") else 0,
-                    "total_tokens": getattr(r.usage, "total_tokens", 0) if hasattr(r, "usage") else 0,
-                }
-                TOKENS_SINK(usage_data)
-            except Exception:
-                pass
-    else:
-        # Ancienne API Chat Completions pour GPT-4.1
-        r = client.chat.completions.create(
-            model=GPT_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": "Tu es un expert du CIR/CII."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
-            max_completion_tokens=max_tokens,
-        )
-        txt = r.choices[0].message.content or ""
+    try:
+        if USE_RESPONSES_API:
+            # Nouvelle API Responses pour GPT-5.2
+            # Note: GPT-5.2 ne supporte pas le paramètre temperature
+            r = client.responses.create(
+                model=GPT_DEPLOYMENT,
+                input=[
+                    {"role": "system", "content": "Tu es un expert rédaction scientifique."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_output_tokens=max_tokens,
+            )
+            txt = r.output_text or ""
 
-        if TOKENS_SINK:
-            u = _extract_usage(r)
-            try:
-                TOKENS_SINK(
-                    {
+            # Extraction des tokens pour TOKENS_SINK
+            if TOKENS_SINK:
+                try:
+                    usage_data = {
                         "meta": meta,
-                        **{k: int(u.get(k, 0)) for k in ("prompt_tokens", "completion_tokens", "total_tokens")},
+                        "prompt_tokens": getattr(r.usage, "input_tokens", 0) if hasattr(r, "usage") else 0,
+                        "completion_tokens": getattr(r.usage, "output_tokens", 0) if hasattr(r, "usage") else 0,
+                        "total_tokens": getattr(r.usage, "total_tokens", 0) if hasattr(r, "usage") else 0,
                     }
-                )
-            except Exception:
-                pass
+                    TOKENS_SINK(usage_data)
+                except Exception:
+                    pass
+        else:
+            # Ancienne API Chat Completions pour GPT-4.1
+            r = client.chat.completions.create(
+                model=GPT_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": "Tu es un expert rédaction scientifique."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_completion_tokens=max_tokens,
+            )
+            txt = r.choices[0].message.content or ""
 
-    return txt
+            if TOKENS_SINK:
+                u = _extract_usage(r)
+                try:
+                    TOKENS_SINK(
+                        {
+                            "meta": meta,
+                            **{k: int(u.get(k, 0)) for k in ("prompt_tokens", "completion_tokens", "total_tokens")},
+                        }
+                    )
+                except Exception:
+                    pass
+
+        elapsed = time.time() - start_time
+        print(f"[CALL_AI] Succes - meta={meta}, reponse={len(txt)} chars, duree={elapsed:.1f}s")
+        return txt
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[CALL_AI] ERREUR - meta={meta}, duree={elapsed:.1f}s, erreur={type(e).__name__}: {e}")
+        raise
 
 # -------------------- RAG helpers --------------------
 def search_similar_chunks(query: str, index, chunks: List[str], vectors, top_k: int = 3):
@@ -402,7 +420,10 @@ def generate_resume_from_sections(sections: dict, *, objectif_unique: str, verro
     Génère un résumé basé sur les sections déjà générées du document CIR.
     Garantit que le résumé reflète exactement le contenu du document final.
     """
+    import time
     from app.services.prompts import prompt_cir_resume
+
+    print("[RESUME] Debut generation du resume...")
 
     # Construire le contenu des sections pour le prompt
     sections_content = ""
@@ -434,20 +455,54 @@ def generate_resume_from_sections(sections: dict, *, objectif_unique: str, verro
     if sections.get("gestion"):
         sections_content += f"\n\n=== GESTION DE LA RECHERCHE ===\n{sections['gestion']}"
 
+    # Limiter la taille du contenu des sections pour eviter les timeouts
+    MAX_SECTION_CHARS = 25000  # ~6000 tokens
+    if len(sections_content) > MAX_SECTION_CHARS:
+        print(f"[RESUME] ATTENTION: Contenu trop long ({len(sections_content)} chars), truncation a {MAX_SECTION_CHARS}")
+        sections_content = sections_content[:MAX_SECTION_CHARS] + "\n\n[... contenu tronqué pour le résumé ...]"
+
+    print(f"[RESUME] Taille du contenu des sections: {len(sections_content)} caracteres")
+
     # Récupérer le template du prompt depuis le blob
-    prompt_template = prompt_cir_resume()
+    print("[RESUME] Chargement du template prompt depuis blob...")
+    try:
+        prompt_template = prompt_cir_resume()
+        print(f"[RESUME] Template charge: {len(prompt_template)} caracteres")
+    except Exception as e:
+        print(f"[RESUME] ERREUR chargement template: {type(e).__name__}: {e}")
+        raise
 
     # Remplacer les variables dans le prompt
-    prompt = prompt_template.format(
-        sections_content=sections_content,
-        societe=societe,
-        annee=annee,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
-        articles=_articles_list_str(articles)
-    )
+    print("[RESUME] Formatage du prompt...")
+    try:
+        articles_str = _articles_list_str(articles)
+        prompt = prompt_template.format(
+            sections_content=sections_content,
+            societe=societe,
+            annee=annee,
+            objectif_unique=objectif_unique,
+            verrou_unique=verrou_unique,
+            articles=articles_str,
+            liste_articles=articles_str,  # Le template utilise {liste_articles}
+        )
+        print(f"[RESUME] Prompt formate: {len(prompt)} caracteres")
+    except Exception as e:
+        print(f"[RESUME] ERREUR formatage prompt: {type(e).__name__}: {e}")
+        raise
 
-    return call_ai(prompt, meta="resume_from_sections", temperature=0.3)
+    print(f"[RESUME] Taille totale du prompt: {len(prompt)} caracteres (~{len(prompt)//4} tokens)")
+    print("[RESUME] Appel LLM en cours...")
+
+    start_time = time.time()
+    try:
+        result = call_ai(prompt, meta="resume_from_sections", temperature=0.3)
+        elapsed = time.time() - start_time
+        print(f"[RESUME] Resume genere avec succes en {elapsed:.1f}s ({len(result)} chars)")
+        return result
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[RESUME] ERREUR apres {elapsed:.1f}s: {type(e).__name__}: {e}")
+        raise
 
 # -------------------- Bibliographie, RH, evaluateur_travaux : gardez votre code existant --------------------
 # (Je ne le recopie pas ici pour éviter d'introduire des divergences non nécessaires.)
@@ -631,8 +686,16 @@ def wrap_questions_rouge(texte: str) -> str:
 def enrich_manual_articles_iso(
     articles: List[dict],
     articles_texts: List[str],
+    max_retries: int = 2,
 ) -> List[dict]:
+    """
+    Enrichit les articles manuels (sans auteurs/citations) avec les metadonnees ISO 690.
+    Ajoute des logs de progression et retry en cas d'echec.
+    """
+    import time
+
     if not articles:
+        print("[ISO690] Aucun article a enrichir")
         return []
 
     out: List[dict] = [dict(a) for a in articles]
@@ -641,13 +704,30 @@ def enrich_manual_articles_iso(
         if not (a.get("authors") or "").strip() and int(a.get("citations") or 0) == 0
     ]
 
+    total_manual = len(manual_idxs)
+    print(f"[ISO690] Debut enrichissement: {total_manual} articles manuels a traiter sur {len(articles)} total")
+
+    if total_manual == 0:
+        print("[ISO690] Aucun article manuel a enrichir (tous ont deja des auteurs/citations)")
+        return out
+
     txt_idx = 0
+    processed = 0
+    errors = 0
+
     for i in manual_idxs:
+        processed += 1
+        article_title = out[i].get("title", "Sans titre")[:50]
+        print(f"[ISO690] Traitement article {processed}/{total_manual}: '{article_title}...'")
+        start_time = time.time()
+
         if txt_idx >= len(articles_texts):
+            print(f"[ISO690] Plus de texte disponible pour l'article {processed}")
             break
         txt = (articles_texts[txt_idx] or "").strip()
         txt_idx += 1
         if not txt:
+            print(f"[ISO690] Texte vide pour l'article {processed}, passage au suivant")
             continue
 
         snippet = txt[:4000]
@@ -657,7 +737,7 @@ Tu es un expert en normalisation bibliographique (norme ISO 690).
 On te fournit le début du texte d'un article scientifique.
 
 Objectif:
-1. Identifier les métadonnées principales: 
+1. Identifier les métadonnées principales:
    - auteurs (liste),
    - titre de l'article,
    - titre de la revue ou conférence,
@@ -683,34 +763,52 @@ Format de réponse STRICT (JSON UTF-8) :
 
 Ne renvoie que le JSON, sans texte avant ni après.
 """
-        try:
-            raw = call_ai(prompt, meta="ISO690_manual_article")
-            raw = (raw or "").strip()
-            start = raw.find("{")
-            end = raw.rfind("}")
-            json_str = raw[start : end + 1] if start != -1 and end != -1 else "{}"
-            data = json.loads(json_str)
+        # Retry logic
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    print(f"[ISO690] Retry {attempt}/{max_retries} pour l'article {processed}")
+                    time.sleep(2 * attempt)  # Backoff exponentiel
 
-            a = out[i]
-            if data.get("authors"):
-                a["authors"] = data["authors"]
-            if data.get("title"):
-                a["title"] = data["title"]
-            if data.get("journal"):
-                a["journal"] = data["journal"]
-            if data.get("year"):
-                try:
-                    a["year"] = int(data["year"])
-                except Exception:
-                    pass
-            if data.get("volume"):
-                a["volume"] = str(data["volume"])
-            if data.get("pages"):
-                a["pages"] = str(data["pages"])
-            if data.get("iso_citation"):
-                a["iso_citation"] = data["iso_citation"]
+                raw = call_ai(prompt, meta="ISO690_manual_article")
+                raw = (raw or "").strip()
+                start = raw.find("{")
+                end = raw.rfind("}")
+                json_str = raw[start : end + 1] if start != -1 and end != -1 else "{}"
+                data = json.loads(json_str)
 
-        except Exception as e:
-            print(f"[ISO690] Erreur enrichissement article manuel: {e}")
+                a = out[i]
+                if data.get("authors"):
+                    a["authors"] = data["authors"]
+                if data.get("title"):
+                    a["title"] = data["title"]
+                if data.get("journal"):
+                    a["journal"] = data["journal"]
+                if data.get("year"):
+                    try:
+                        a["year"] = int(data["year"])
+                    except Exception:
+                        pass
+                if data.get("volume"):
+                    a["volume"] = str(data["volume"])
+                if data.get("pages"):
+                    a["pages"] = str(data["pages"])
+                if data.get("iso_citation"):
+                    a["iso_citation"] = data["iso_citation"]
 
+                elapsed = time.time() - start_time
+                print(f"[ISO690] Article {processed}/{total_manual} enrichi en {elapsed:.1f}s")
+                last_error = None
+                break  # Succes, sortir de la boucle retry
+
+            except Exception as e:
+                last_error = e
+                print(f"[ISO690] Erreur article {processed} (tentative {attempt + 1}): {type(e).__name__}: {e}")
+
+        if last_error:
+            errors += 1
+            print(f"[ISO690] Echec definitif pour l'article {processed} apres {max_retries + 1} tentatives")
+
+    print(f"[ISO690] Enrichissement termine: {processed - errors}/{total_manual} articles enrichis, {errors} erreurs")
     return out
