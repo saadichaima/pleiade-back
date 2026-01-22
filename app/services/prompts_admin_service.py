@@ -5,7 +5,7 @@ Permet de lister, récupérer et mettre à jour les prompts pour l'admin.
 """
 from typing import List, Optional
 from datetime import datetime
-from azure.storage.blob import BlobServiceClient, BlobProperties
+from azure.storage.blob import BlobServiceClient, BlobProperties, ContentSettings
 from azure.core.exceptions import ResourceNotFoundError
 from app.config import settings
 from app.services.blob_client import get_blob_service_client
@@ -211,7 +211,7 @@ def update_prompt(section: str, type_dossier: str, content: str) -> Optional[Pro
         blob_client.upload_blob(
             content.encode("utf-8"),
             overwrite=True,
-            content_settings={"content_type": "text/plain; charset=utf-8"}
+            content_settings=ContentSettings(content_type="text/plain; charset=utf-8")
         )
 
         # Récupérer les nouvelles propriétés
