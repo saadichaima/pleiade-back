@@ -268,7 +268,7 @@ def _generate_docx_sync(
     with open(out_path, "rb") as f:
         content = f.read()
 
-    filename = f"{info.projet_name}_{type_dossier}_{info.annee}_VIA.docx"
+    filename = f"{info.societe}_{type_dossier}_{info.annee}_VIA.docx"
     emit("done", "Dossier prêt", 100)
     return content, filename
 

@@ -1,9 +1,16 @@
 # app/models/schemas.py
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from typing import List, Optional, Literal
 from pydantic import ConfigDict
 
 DossierType = Literal["CIR", "CII"]
+
+
+def _capitalize_first(value: str) -> str:
+    """Met la première lettre en majuscule sans modifier le reste."""
+    if not value:
+        return value
+    return value[0].upper() + value[1:]
 
 
 class FormInfo(BaseModel):
@@ -26,6 +33,11 @@ class FormInfo(BaseModel):
     })
     societe: str
     projet_name: str
+
+    @field_validator("societe", "projet_name")
+    @classmethod
+    def capitalize_first_letter(cls, v: str) -> str:
+        return _capitalize_first(v)
     annee: int
     site_web: Optional[str] = ""
     responsable_innovation: str

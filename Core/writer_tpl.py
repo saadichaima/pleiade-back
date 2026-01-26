@@ -29,6 +29,7 @@ def _collapse_spaces(text: str) -> str:
 def _apply_markdown_style(par):
     """
     Transforme **texte** en gras et *texte* en italique dans un paragraphe.
+    Gère les formats imbriqués : **gras *italique* gras** ou *italique **gras** italique*
     Reconstruit les runs en supprimant les astérisques.
     IMPORTANT : ne pas appeler sur les titres/couverture (on les skip).
     """
@@ -37,51 +38,59 @@ def _apply_markdown_style(par):
         return
 
     par.clear()
+
+    # Parser avec pile d'états pour gérer l'imbrication
     i = 0
     n = len(raw)
+    current_text = ""
+    is_bold = False
+    is_italic = False
 
     while i < n:
-        # gras **...**
+        # Détection gras **
         if i + 1 < n and raw[i] == "*" and raw[i + 1] == "*":
-            end = raw.find("**", i + 2)
-            if end == -1:
-                chunk = raw[i:]
-                if chunk:
-                    r = par.add_run(chunk)
+            # Vérifier que ce n'est pas *** (gras+italique)
+            if i + 2 < n and raw[i + 2] == "*":
+                # *** = bascule gras ET italique
+                if current_text:
+                    r = par.add_run(current_text)
                     r.font.name = DEFAULT_FONT
-                break
-            content = raw[i + 2 : end]
-            if content:
-                r = par.add_run(content)
-                r.bold = True
-                r.font.name = DEFAULT_FONT
-            i = end + 2
-
-        # italique *...*
+                    r.bold = is_bold
+                    r.italic = is_italic
+                    current_text = ""
+                is_bold = not is_bold
+                is_italic = not is_italic
+                i += 3
+            else:
+                # ** = bascule gras
+                if current_text:
+                    r = par.add_run(current_text)
+                    r.font.name = DEFAULT_FONT
+                    r.bold = is_bold
+                    r.italic = is_italic
+                    current_text = ""
+                is_bold = not is_bold
+                i += 2
+        # Détection italique *
         elif raw[i] == "*":
-            end = raw.find("*", i + 1)
-            if end == -1:
-                chunk = raw[i:]
-                if chunk:
-                    r = par.add_run(chunk)
-                    r.font.name = DEFAULT_FONT
-                break
-            content = raw[i + 1 : end]
-            if content:
-                r = par.add_run(content)
-                r.italic = True
+            if current_text:
+                r = par.add_run(current_text)
                 r.font.name = DEFAULT_FONT
-            i = end + 1
-
+                r.bold = is_bold
+                r.italic = is_italic
+                current_text = ""
+            is_italic = not is_italic
+            i += 1
         else:
-            j = i
-            while j < n and raw[j] != "*":
-                j += 1
-            chunk = raw[i:j]
-            if chunk:
-                r = par.add_run(chunk)
-                r.font.name = DEFAULT_FONT
-            i = j
+            current_text += raw[i]
+            i += 1
+
+    # Flush le reste
+    if current_text:
+        r = par.add_run(current_text)
+        r.font.name = DEFAULT_FONT
+        r.bold = is_bold
+        r.italic = is_italic
 
 
 def _iter_all_paragraphs(doc: DocxDocument):
