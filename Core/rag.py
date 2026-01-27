@@ -592,8 +592,8 @@ Renvoie un JSON avec cette structure exacte (tableau de personnes):
     "nom_prenom": "NOM Prénom réel du CV",
     "diplome": "Diplôme le plus élevé trouvé dans le CV ou vide",
     "fonction": "Fonction dans l'opération trouvée dans le CV ou vide",
-    "contribution": "Contribution décrite dans le CV ou vide",
-    "temps": "Temps/heures mentionné dans le CV ou vide"
+    "contribution": "Contribution lié à une activité de recherche ou vide",
+    "temps": "à compléter par le client ou vide "
   }}
 ]
 ```

@@ -26,8 +26,9 @@ from app.services.web_scraper import extract_website_context
 from app.services.cosmos_client import get_projects_container, get_outputs_container
 from app.services.blob_client import upload_bytes_to_blob
 
-from Core import document, embeddings, rag, writer
+from Core import document, embeddings, rag, writer, writer_tpl
 from Core import rag as core_rag
+from docx import Document as DocxDocument
 from Core.images_figures import insert_images_by_reference_live
 
 router = APIRouter()
@@ -145,6 +146,31 @@ def _generate_docx_sync(
 ) -> Tuple[bytes, str]:
     info = req.info
     type_dossier = info.type_dossier
+    has_articles = bool(articles_pdfs_data) or bool(req.articles)
+
+    # Définir les étapes dynamiques selon le type de dossier
+    steps_list = [
+        {"key": "init", "label": "Initialisation"},
+        {"key": "read_docs", "label": "Analyse des documents fournis"},
+        {"key": "rag_index", "label": "Construction des index (RAG)"},
+    ]
+
+    # Articles scientifiques uniquement si fournis
+    if has_articles:
+        steps_list.append({"key": "articles", "label": "Analyse des articles scientifiques"})
+
+    steps_list.extend([
+        {"key": "sections", "label": "Génération du contenu scientifique"},
+        {"key": "figures", "label": "Analyse et planification des figures"},
+        {"key": "rh", "label": "Analyse des ressources humaines"},
+        {"key": "docx", "label": "Génération du document Word"},
+        {"key": "insert_figures", "label": "Insertion des figures"},
+        {"key": "finalize", "label": "Finalisation et sauvegarde"},
+        {"key": "done", "label": "Terminé"},
+    ])
+
+    # Envoyer la liste des étapes au frontend
+    emit("steps", steps_list, 0)
 
     emit("init", "Initialisation de la génération", 5)
 
@@ -165,21 +191,22 @@ def _generate_docx_sync(
     emit("rag_index", "Construction des index de recherche (RAG)", 25)
     pack_client, pack_admin, pack_mix = build_rag_indexes(text_client, text_admin)
 
-    # 3) Articles
-    emit("articles", "Analyse des articles scientifiques", 35)
+    # 3) Articles (uniquement si fournis)
     text_articles = ""
     articles_texts: List[str] = []
-    for d in articles_pdfs_data:
-        txt = document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
-        text_articles += "\n" + txt
-        articles_texts.append(txt)
+    pack_articles = (None, [], [])
 
-    chunks_art = [c for c in document.chunk_text(text_articles) if c.strip()]
-    if chunks_art:
-        index_art, vectors_art = embeddings.build_index(chunks_art)
-        pack_articles = (index_art, chunks_art, vectors_art)
-    else:
-        pack_articles = (None, [], [])
+    if has_articles:
+        emit("articles", "Analyse des articles scientifiques", 35)
+        for d in articles_pdfs_data:
+            txt = document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
+            text_articles += "\n" + txt
+            articles_texts.append(txt)
+
+        chunks_art = [c for c in document.chunk_text(text_articles) if c.strip()]
+        if chunks_art:
+            index_art, vectors_art = embeddings.build_index(chunks_art)
+            pack_articles = (index_art, chunks_art, vectors_art)
 
     # 4) Generate sections
     emit("sections", "Génération du contenu scientifique", 45)
@@ -252,6 +279,19 @@ def _generate_docx_sync(
         logo_bytes=logo_bytes,
     )
 
+    # 6b) Insert tableau comparatif (CII uniquement)
+    if type_dossier.upper() == "CII" and sections.get("tableau_comparatif"):
+        tableau_data = sections["tableau_comparatif"]
+        if tableau_data.get("elements"):
+            doc = DocxDocument(out_path)
+            writer_tpl.insert_comparison_table(
+                doc,
+                placeholder="[[TABLEAU_COMPARATIF]]",
+                data=tableau_data,
+                client_name=info.societe,
+            )
+            doc.save(out_path)
+
     # 7) Insert figures
     emit("insert_figures", "Insertion des figures dans le document", 85)
     if src_docx_figures:
@@ -317,9 +357,14 @@ async def start_generate_job(
 
     async def _runner():
         try:
-            def emit(step: str, label: str, percent: int):
-                _log_progress(step, label, percent)
-                job.emit_threadsafe({"type": "progress", "step": step, "label": label, "percent": percent})
+            def emit(step: str, label_or_steps, percent: int):
+                # Cas spécial: envoi de la liste des étapes dynamiques
+                if step == "steps" and isinstance(label_or_steps, list):
+                    job.emit_threadsafe({"type": "steps", "steps": label_or_steps})
+                    return
+                # Cas normal: progression
+                _log_progress(step, label_or_steps, percent)
+                job.emit_threadsafe({"type": "progress", "step": step, "label": label_or_steps, "percent": percent})
 
             content, filename = await anyio.to_thread.run_sync(
                 _generate_docx_sync,
