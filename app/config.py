@@ -46,7 +46,7 @@ class Settings(BaseModel):
     COSMOS_URI: str = os.getenv("COSMOS_URI", "")
     COSMOS_KEY: str = os.getenv("COSMOS_KEY", "")
     # ex: pleiades-db (dev) / pleiades-db-preprod / pleiades-db-prod
-    COSMOS_DB_NAME: str = os.getenv("COSMOS_DB_NAME", "pleiades-db")
+    COSMOS_DB_NAME: str = os.getenv("COSMOS_DB_NAME", "pleiades-db-preprod")
     COSMOS_CONTAINER_PROJECTS: str = os.getenv("COSMOS_CONTAINER_PROJECTS", "projects")
     COSMOS_CONTAINER_DOCUMENTS: str = os.getenv("COSMOS_CONTAINER_DOCUMENTS", "documents")
     COSMOS_CONTAINER_OUTPUTS: str = os.getenv("COSMOS_CONTAINER_OUTPUTS", "outputs")
@@ -88,5 +88,8 @@ class Settings(BaseModel):
 
     # ===== Cosmos Users =====
     COSMOS_CONTAINER_USERS: str = os.getenv("COSMOS_CONTAINER_USERS", "users")
+
+    # ===== Cosmos Jobs (persistance des jobs de génération) =====
+    COSMOS_CONTAINER_JOBS: str = os.getenv("COSMOS_CONTAINER_JOBS", "jobs")
 
 settings = Settings()
