@@ -468,8 +468,8 @@ Renvoie un JSON valide avec cette structure:
       "nom_prenom": "NOM Prénom réel trouvé dans les docs",
       "diplome": "Diplôme réel ou vide",
       "fonction": "Fonction réelle ou vide",
-      "contribution": "Contribution réelle ou vide",
-      "temps": "Heures réelles ou vide"
+      "contribution": "Contribution réelle liée à une activité d'innovation ou vide",
+      "temps": "à compléter par le client ou vide"
     }
   ]
 }
@@ -565,3 +565,108 @@ def evaluateur_travaux(texte: str, *, type_dossier: str = "CII") -> str:
 QUESTION_RE = re.compile(
     r"(?is)\b(?:Pouvez|Pourriez)[\-\u2011\u2013 ]vous[^?]*\?"
 )
+
+
+def generate_tableau_comparatif(
+    i, c, v,  # index RAG
+    *,
+    societe: str,
+    projet: str,
+    competitors: List[Dict[str, Any]],
+    section_travaux: str,
+    section_concurrence: str,
+) -> Dict[str, Any]:
+    """
+    Génère les données JSON pour le tableau comparatif CII.
+    Analyse les sections travaux et concurrence pour extraire les éléments
+    différenciants et évaluer leur présence chez les concurrents.
+
+    Retourne:
+    {
+        "elements": [
+            {
+                "nom": "Element 1",
+                "client": "Oui",
+                "concurrents": {"Concurrent A": "Non", "Concurrent B": "Partiel"}
+            },
+            ...
+        ]
+    }
+    """
+    competitors_names = [comp.get("name", "") for comp in competitors if comp.get("name")]
+
+    if not competitors_names:
+        print("[TABLEAU] Aucun concurrent fourni, tableau vide")
+        return {"elements": []}
+
+    competitors_list = ", ".join(competitors_names)
+
+    prompt = f"""Tu es un expert en analyse concurrentielle pour dossiers CII (Crédit Impôt Innovation).
+
+CONTEXTE:
+- Société cliente: {societe}
+- Projet innovant: {projet}
+- Concurrents analysés: {competitors_list}
+
+SECTION TRAVAUX DU DOSSIER:
+{section_travaux[:8000]}
+
+SECTION ANALYSE CONCURRENTIELLE:
+{section_concurrence[:8000]}
+
+TÂCHE:
+1. Extrais les 5 à 8 éléments/fonctionnalités clés qui différencient le projet "{projet}" de la société "{societe}"
+2. Pour chaque élément, évalue si le client et chaque concurrent le possède
+
+RÈGLES IMPORTANTES:
+- "Oui" = La fonctionnalité est présente et performante
+- "Non" = La fonctionnalité est absente ou très limitée
+- "Partiel" = La fonctionnalité existe mais est incomplète ou moins performante
+- Le client ({societe}) doit avoir "Oui" pour TOUS ses éléments (c'est son innovation)
+- Base-toi sur les informations des sections fournies pour évaluer les concurrents
+- Si tu n'as pas d'information sur un concurrent pour un élément, mets "Non" par défaut
+
+CONCURRENTS À ÉVALUER: {competitors_list}
+
+Réponds UNIQUEMENT avec ce JSON valide, sans texte avant ni après, sans markdown:
+{{
+  "elements": [
+    {{
+      "nom": "Nom court de l'élément (max 50 caractères)",
+      "client": "Oui",
+      "concurrents": {{
+        "{competitors_names[0]}": "Oui|Non|Partiel"{"".join([f',"{name}": "Oui|Non|Partiel"' for name in competitors_names[1:]])}
+      }}
+    }}
+  ]
+}}"""
+
+    raw = generate_section_with_rag("Tableau comparatif", prompt, i, c, v)
+
+    # Parser le JSON
+    try:
+        cleaned = raw.strip()
+        # Supprimer les balises markdown si présentes
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned)
+            cleaned = re.sub(r'\n?```\s*$', '', cleaned)
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        if start != -1 and end > start:
+            json_str = cleaned[start:end]
+            data = json.loads(json_str)
+
+            # Validation basique
+            if "elements" in data and isinstance(data["elements"], list):
+                print(f"[TABLEAU] {len(data['elements'])} éléments extraits")
+                return data
+
+    except json.JSONDecodeError as e:
+        print(f"[TABLEAU] Erreur parsing JSON: {e}")
+        print(f"[TABLEAU] Contenu reçu: {raw[:300]}...")
+    except Exception as e:
+        print(f"[TABLEAU] Erreur inattendue: {e}")
+
+    # Fallback: structure vide
+    return {"elements": []}

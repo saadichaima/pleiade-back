@@ -385,6 +385,71 @@ def _caption_for_num(captions_text, num: int):
 
 
 # ==========================
+# Nettoyage des références orphelines
+# ==========================
+
+def _remove_orphan_references_from_paragraph(p_elm, orphan_nums: set[int]) -> int:
+    """
+    Supprime les références orphelines (cf. Figure N, voir Figure N) d'un paragraphe.
+    Retourne le nombre de références supprimées.
+    """
+    if not orphan_nums:
+        return 0
+
+    # Pattern pour capturer les références avec contexte (parenthèses, espaces)
+    # Ex: "(cf. Figure 5)", "cf. Figure 5", "(voir Figure 5)", "voir Figure 5"
+    ORPHAN_RE = re.compile(
+        r'\s*\(?\s*(?:cf\.\s*|voir\s+)(?:fig(?:\.|ure)?|image)\s*[:\-–]?\s*(\d+)\s*\)?\s*',
+        re.IGNORECASE
+    )
+
+    removed_count = 0
+
+    # Parcourir tous les éléments w:t (texte) du paragraphe
+    try:
+        t_elements = p_elm.xpath(".//*[local-name()='t']")
+    except Exception:
+        return 0
+
+    for t_el in t_elements:
+        text = t_el.text or ""
+        if not text:
+            continue
+
+        def replace_orphan(m):
+            nonlocal removed_count
+            try:
+                fig_num = int(m.group(1))
+                if fig_num in orphan_nums:
+                    removed_count += 1
+                    return ""  # Supprimer la référence
+            except Exception:
+                pass
+            return m.group(0)  # Garder la référence
+
+        new_text = ORPHAN_RE.sub(replace_orphan, text)
+        if new_text != text:
+            t_el.text = new_text
+
+    return removed_count
+
+
+def _remove_orphan_references(doc: Document, orphan_nums: set[int]) -> int:
+    """
+    Parcourt tout le document et supprime les références orphelines.
+    Retourne le nombre total de références supprimées.
+    """
+    if not orphan_nums:
+        return 0
+
+    total_removed = 0
+    for p in _iter_all_paragraphs_doc(doc):
+        total_removed += _remove_orphan_references_from_paragraph(p._p, orphan_nums)
+
+    return total_removed
+
+
+# ==========================
 # Fonction principale : insertion des images par référence
 # ==========================
 def insert_images_by_reference_live(
@@ -398,10 +463,13 @@ def insert_images_by_reference_live(
     nbspace_before_colon: bool = True,
     renumber_references: bool = False,
     target_label: str = "Figure",
+    remove_orphan_references: bool = True,
 ) -> str:
     """
     Insère les images juste après le paragraphe qui contient une référence
     de type 'cf. Figure N' ou 'voir Figure N'.
+
+    Si remove_orphan_references=True, supprime les références sans image correspondante.
     """
     print(
         f"[images_figures] insert_images_by_reference_live: src={src_docx}, "
@@ -424,6 +492,7 @@ def insert_images_by_reference_live(
     )
 
     inserted_for_num: set[int] = set()
+    orphan_refs: set[int] = set()  # Références sans image correspondante
     inserted_count = 0
     missing_count = 0
     seen_refs: set[int] = set()
@@ -467,6 +536,7 @@ def insert_images_by_reference_live(
                 continue
             if fig_num not in num_to_img:
                 missing_count += 1
+                orphan_refs.add(fig_num)
                 continue
 
             img_bytes, _ext = num_to_img[fig_num]
@@ -488,9 +558,19 @@ def insert_images_by_reference_live(
             inserted_for_num.add(fig_num)
             inserted_count += 1
 
+    # Nettoyage des références orphelines si activé
+    orphan_removed_count = 0
+    if remove_orphan_references and orphan_refs:
+        orphan_removed_count = _remove_orphan_references(docB, orphan_refs)
+        print(
+            f"[images_figures] Références orphelines supprimées: {orphan_removed_count} "
+            f"(figures: {sorted(orphan_refs)})"
+        )
+
     docB.save(out_docx)
     print(
         f"[images_figures] terminé. Références vues: {sorted(seen_refs) if seen_refs else 'aucune'}, "
-        f"images insérées: {inserted_count}, références sans image: {missing_count}"
+        f"images insérées: {inserted_count}, références sans image: {missing_count}, "
+        f"références orphelines nettoyées: {orphan_removed_count}"
     )
     return out_docx

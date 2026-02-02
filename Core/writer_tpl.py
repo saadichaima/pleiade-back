@@ -29,6 +29,7 @@ def _collapse_spaces(text: str) -> str:
 def _apply_markdown_style(par):
     """
     Transforme **texte** en gras et *texte* en italique dans un paragraphe.
+    Gère les formats imbriqués : **gras *italique* gras** ou *italique **gras** italique*
     Reconstruit les runs en supprimant les astérisques.
     IMPORTANT : ne pas appeler sur les titres/couverture (on les skip).
     """
@@ -37,51 +38,59 @@ def _apply_markdown_style(par):
         return
 
     par.clear()
+
+    # Parser avec pile d'états pour gérer l'imbrication
     i = 0
     n = len(raw)
+    current_text = ""
+    is_bold = False
+    is_italic = False
 
     while i < n:
-        # gras **...**
+        # Détection gras **
         if i + 1 < n and raw[i] == "*" and raw[i + 1] == "*":
-            end = raw.find("**", i + 2)
-            if end == -1:
-                chunk = raw[i:]
-                if chunk:
-                    r = par.add_run(chunk)
+            # Vérifier que ce n'est pas *** (gras+italique)
+            if i + 2 < n and raw[i + 2] == "*":
+                # *** = bascule gras ET italique
+                if current_text:
+                    r = par.add_run(current_text)
                     r.font.name = DEFAULT_FONT
-                break
-            content = raw[i + 2 : end]
-            if content:
-                r = par.add_run(content)
-                r.bold = True
-                r.font.name = DEFAULT_FONT
-            i = end + 2
-
-        # italique *...*
+                    r.bold = is_bold
+                    r.italic = is_italic
+                    current_text = ""
+                is_bold = not is_bold
+                is_italic = not is_italic
+                i += 3
+            else:
+                # ** = bascule gras
+                if current_text:
+                    r = par.add_run(current_text)
+                    r.font.name = DEFAULT_FONT
+                    r.bold = is_bold
+                    r.italic = is_italic
+                    current_text = ""
+                is_bold = not is_bold
+                i += 2
+        # Détection italique *
         elif raw[i] == "*":
-            end = raw.find("*", i + 1)
-            if end == -1:
-                chunk = raw[i:]
-                if chunk:
-                    r = par.add_run(chunk)
-                    r.font.name = DEFAULT_FONT
-                break
-            content = raw[i + 1 : end]
-            if content:
-                r = par.add_run(content)
-                r.italic = True
+            if current_text:
+                r = par.add_run(current_text)
                 r.font.name = DEFAULT_FONT
-            i = end + 1
-
+                r.bold = is_bold
+                r.italic = is_italic
+                current_text = ""
+            is_italic = not is_italic
+            i += 1
         else:
-            j = i
-            while j < n and raw[j] != "*":
-                j += 1
-            chunk = raw[i:j]
-            if chunk:
-                r = par.add_run(chunk)
-                r.font.name = DEFAULT_FONT
-            i = j
+            current_text += raw[i]
+            i += 1
+
+    # Flush le reste
+    if current_text:
+        r = par.add_run(current_text)
+        r.font.name = DEFAULT_FONT
+        r.bold = is_bold
+        r.italic = is_italic
 
 
 def _iter_all_paragraphs(doc: DocxDocument):
@@ -525,3 +534,126 @@ def clean_custom_tags(path: str):
                     _new_run(part, make_red=False)
 
     doc.save(path)
+
+
+# =============================================================================
+# TABLEAU COMPARATIF CII
+# =============================================================================
+
+def insert_comparison_table(doc, placeholder: str, data: dict, client_name: str):
+    """
+    Insère un tableau comparatif basique (noir et blanc) à l'emplacement du placeholder.
+
+    Args:
+        doc: Document python-docx
+        placeholder: Texte du placeholder (ex: "[[TABLEAU_COMPARATIF]]")
+        data: Dictionnaire avec la structure:
+            {
+                "elements": [
+                    {
+                        "nom": "Element 1",
+                        "client": "Oui",
+                        "concurrents": {"Concurrent A": "Non", "Concurrent B": "Partiel"}
+                    },
+                    ...
+                ]
+            }
+        client_name: Nom de la société cliente (pour l'en-tête)
+    """
+    elements = data.get("elements", [])
+    if not elements:
+        print("[TABLEAU] Aucun élément à insérer")
+        return False
+
+    # Collecter tous les noms de concurrents
+    all_competitors = set()
+    for elem in elements:
+        all_competitors.update(elem.get("concurrents", {}).keys())
+    competitors = sorted(all_competitors)
+
+    if not competitors:
+        print("[TABLEAU] Aucun concurrent trouvé dans les données")
+        return False
+
+    # Trouver le paragraphe contenant le placeholder
+    target_paragraph = None
+    for para in doc.paragraphs:
+        if placeholder in para.text:
+            target_paragraph = para
+            break
+
+    if not target_paragraph:
+        print(f"[TABLEAU] Placeholder '{placeholder}' non trouvé")
+        return False
+
+    # Créer le tableau
+    # Colonnes: Élément | Client | Concurrent1 | Concurrent2 | ...
+    num_cols = 2 + len(competitors)
+    num_rows = 1 + len(elements)  # Header + lignes de données
+
+    table = doc.add_table(rows=num_rows, cols=num_cols)
+    table.style = "Table Grid"
+
+    # === En-tête (noir et blanc, texte gras centré) ===
+    header_cells = table.rows[0].cells
+    header_cells[0].text = "Élément"
+    header_cells[1].text = client_name
+
+    for idx, comp_name in enumerate(competitors):
+        header_cells[2 + idx].text = comp_name
+
+    # Style en-tête : gras, centré, noir
+    for cell in header_cells:
+        for para in cell.paragraphs:
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in para.runs:
+                run.font.bold = True
+                run.font.name = DEFAULT_FONT
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0, 0, 0)
+
+    # === Lignes de données ===
+    for row_idx, elem in enumerate(elements):
+        row = table.rows[1 + row_idx]
+
+        # Colonne: Nom de l'élément (gras et centré)
+        row.cells[0].text = elem.get("nom", "")
+        for para in row.cells[0].paragraphs:
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in para.runs:
+                run.font.bold = True
+                run.font.name = DEFAULT_FONT
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0, 0, 0)
+
+        # Colonne: Valeur client (centré)
+        client_val = elem.get("client", "Oui")
+        row.cells[1].text = client_val
+        for para in row.cells[1].paragraphs:
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in para.runs:
+                run.font.name = DEFAULT_FONT
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0, 0, 0)
+
+        # Colonnes: Valeurs concurrents (centré)
+        concurrents_data = elem.get("concurrents", {})
+        for idx, comp_name in enumerate(competitors):
+            val = concurrents_data.get(comp_name, "?")
+            row.cells[2 + idx].text = val
+            for para in row.cells[2 + idx].paragraphs:
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in para.runs:
+                    run.font.name = DEFAULT_FONT
+                    run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0, 0, 0)
+
+    # Déplacer le tableau à la position du placeholder
+    tbl_element = table._tbl
+    target_paragraph._element.addprevious(tbl_element)
+
+    # Vider le paragraphe du placeholder
+    target_paragraph.clear()
+
+    print(f"[TABLEAU] Inséré avec {len(elements)} éléments et {len(competitors)} concurrents")
+    return True

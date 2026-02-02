@@ -148,6 +148,17 @@ def build_sections_cii(
         performance_type=performance_type,
     )
 
+    # Générer les données du tableau comparatif
+    # Basé sur les sections travaux (demarche) et concurrence (analyse)
+    tableau_comparatif = rag_cii.generate_tableau_comparatif(
+        i, c, v,
+        societe=info.societe,
+        projet=info.projet_name,
+        competitors=concurrents_simpl,
+        section_travaux=demarche,
+        section_concurrence=analyse,
+    )
+
     return {
         "presentation": presentation,    # 👉 d.cii.presentation
         "resume": resume,
@@ -158,4 +169,5 @@ def build_sections_cii(
         "resultats": resultats,
         "rh_intro": rh_intro,
         "biblio_intro": biblio_intro,
+        "tableau_comparatif": tableau_comparatif,  # 👉 Données pour le tableau
     }

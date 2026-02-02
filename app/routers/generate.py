@@ -23,11 +23,12 @@ from app.services.builder_cii import build_sections_cii
 from app.services.figures_planner import prepare_figures_for_cir, prepare_figures_for_cii
 from app.services.web_scraper import extract_website_context
 
-from app.services.cosmos_client import get_projects_container, get_outputs_container
-from app.services.blob_client import upload_bytes_to_blob
+from app.services.cosmos_client import get_projects_container, get_outputs_container, get_jobs_container
+from app.services.blob_client import upload_bytes_to_blob, get_blob_service_client
 
-from Core import document, embeddings, rag, writer
+from Core import document, embeddings, rag, writer, writer_tpl
 from Core import rag as core_rag
+from docx import Document as DocxDocument
 from Core.images_figures import insert_images_by_reference_live
 
 router = APIRouter()
@@ -36,18 +37,30 @@ DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.docu
 
 
 # =========================
-# In-memory job registry
+# Job status constants
+# =========================
+class JobStatus:
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+    ERROR = "error"
+
+
+# =========================
+# In-memory job registry (pour SSE streaming uniquement)
+# La persistance est assurée par Cosmos DB
 # =========================
 
 @dataclass
 class _Job:
     id: str
     user_email: str
+    project_id: str
     loop: asyncio.AbstractEventLoop
     events: List[dict] = field(default_factory=list)
     done: bool = False
     error: Optional[str] = None
-    result: Optional[dict] = None  # {"content": bytes, "filename": str, "project_id": str}
+    result: Optional[dict] = None  # {"content": bytes, "filename": str, "project_id": str, "blob_url": str}
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
 
     async def emit(self, payload: dict) -> None:
@@ -62,11 +75,154 @@ class _Job:
         self.loop.call_soon_threadsafe(_schedule)
 
 
+# Cache mémoire pour les jobs en cours (nécessaire pour SSE)
 _JOBS: Dict[str, _Job] = {}
 
 
 def _log_progress(step: str, label: str, percent: int) -> None:
     print(f"[PROGRESS] {percent}% — {step} — {label}")
+
+
+# =========================
+# Cosmos DB Job persistence
+# =========================
+
+def _create_job_in_cosmos(
+    job_id: str,
+    project_id: str,
+    user_email: str,
+    created_at: str,
+) -> dict:
+    """Crée un job dans Cosmos DB."""
+    jobs = get_jobs_container()
+    job_item = {
+        "id": job_id,
+        "project_id": project_id,  # partition key
+        "user_email": user_email,
+        "status": JobStatus.PENDING,
+        "progress_percent": 0,
+        "current_step": "init",
+        "current_label": "Initialisation",
+        "error_message": None,
+        "blob_url": None,
+        "filename": None,
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    jobs.create_item(job_item)
+    print(f"[JOB] Created in Cosmos: {job_id}")
+    return job_item
+
+
+def _update_job_progress(
+    job_id: str,
+    project_id: str,
+    step: str,
+    label: str,
+    percent: int,
+) -> None:
+    """Met à jour la progression d'un job dans Cosmos DB."""
+    try:
+        jobs = get_jobs_container()
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Patch operation pour mise à jour partielle
+        operations = [
+            {"op": "replace", "path": "/status", "value": JobStatus.IN_PROGRESS},
+            {"op": "replace", "path": "/current_step", "value": step},
+            {"op": "replace", "path": "/current_label", "value": label},
+            {"op": "replace", "path": "/progress_percent", "value": percent},
+            {"op": "replace", "path": "/updated_at", "value": now},
+        ]
+        jobs.patch_item(item=job_id, partition_key=project_id, patch_operations=operations)
+    except Exception as e:
+        print(f"[JOB] Warning: Failed to update progress in Cosmos: {e}")
+
+
+def _complete_job_in_cosmos(
+    job_id: str,
+    project_id: str,
+    filename: str,
+    blob_url: str,
+) -> None:
+    """Marque un job comme terminé dans Cosmos DB."""
+    try:
+        jobs = get_jobs_container()
+        now = datetime.now(timezone.utc).isoformat()
+
+        operations = [
+            {"op": "replace", "path": "/status", "value": JobStatus.DONE},
+            {"op": "replace", "path": "/current_step", "value": "done"},
+            {"op": "replace", "path": "/current_label", "value": "Terminé"},
+            {"op": "replace", "path": "/progress_percent", "value": 100},
+            {"op": "replace", "path": "/filename", "value": filename},
+            {"op": "replace", "path": "/blob_url", "value": blob_url},
+            {"op": "replace", "path": "/updated_at", "value": now},
+        ]
+        jobs.patch_item(item=job_id, partition_key=project_id, patch_operations=operations)
+        print(f"[JOB] Completed in Cosmos: {job_id}")
+    except Exception as e:
+        print(f"[JOB] Warning: Failed to complete job in Cosmos: {e}")
+
+
+def _fail_job_in_cosmos(
+    job_id: str,
+    project_id: str,
+    error_message: str,
+) -> None:
+    """Marque un job comme échoué dans Cosmos DB."""
+    try:
+        jobs = get_jobs_container()
+        now = datetime.now(timezone.utc).isoformat()
+
+        operations = [
+            {"op": "replace", "path": "/status", "value": JobStatus.ERROR},
+            {"op": "replace", "path": "/error_message", "value": error_message[:2000]},  # Truncate
+            {"op": "replace", "path": "/updated_at", "value": now},
+        ]
+        jobs.patch_item(item=job_id, partition_key=project_id, patch_operations=operations)
+        print(f"[JOB] Failed in Cosmos: {job_id}")
+    except Exception as e:
+        print(f"[JOB] Warning: Failed to mark job as failed in Cosmos: {e}")
+
+
+def _find_job_by_id(job_id: str) -> Optional[dict]:
+    """Recherche un job par son ID (sans connaître le project_id)."""
+    try:
+        jobs = get_jobs_container()
+        query = "SELECT * FROM c WHERE c.id = @job_id"
+        params = [{"name": "@job_id", "value": job_id}]
+        results = list(jobs.query_items(query=query, parameters=params, enable_cross_partition_query=True))
+        return results[0] if results else None
+    except Exception as e:
+        print(f"[JOB] Warning: Failed to find job in Cosmos: {e}")
+        return None
+
+
+def _download_blob_content(blob_url: str) -> Optional[bytes]:
+    """Télécharge le contenu d'un blob depuis son URL."""
+    try:
+        # Extraire le nom du blob depuis l'URL
+        # Format: https://<account>.blob.core.windows.net/<container>/<blob_name>
+        from urllib.parse import urlparse, unquote
+
+        parsed = urlparse(blob_url)
+        path_parts = parsed.path.lstrip('/').split('/', 1)
+
+        if len(path_parts) < 2:
+            print(f"[JOB] Invalid blob URL format: {blob_url}")
+            return None
+
+        container_name = path_parts[0]
+        blob_name = unquote(path_parts[1])
+
+        blob_service = get_blob_service_client()
+        blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+
+        return blob_client.download_blob().readall()
+    except Exception as e:
+        print(f"[JOB] Failed to download blob: {e}")
+        return None
 
 
 def _persist_generation(
@@ -145,6 +301,31 @@ def _generate_docx_sync(
 ) -> Tuple[bytes, str]:
     info = req.info
     type_dossier = info.type_dossier
+    has_articles = bool(articles_pdfs_data) or bool(req.articles)
+
+    # Définir les étapes dynamiques selon le type de dossier
+    steps_list = [
+        {"key": "init", "label": "Initialisation"},
+        {"key": "read_docs", "label": "Analyse des documents fournis"},
+        {"key": "rag_index", "label": "Construction des index (RAG)"},
+    ]
+
+    # Articles scientifiques uniquement si fournis
+    if has_articles:
+        steps_list.append({"key": "articles", "label": "Analyse des articles scientifiques"})
+
+    steps_list.extend([
+        {"key": "sections", "label": "Génération du contenu scientifique"},
+        {"key": "figures", "label": "Analyse et planification des figures"},
+        {"key": "rh", "label": "Analyse des ressources humaines"},
+        {"key": "docx", "label": "Génération du document Word"},
+        {"key": "insert_figures", "label": "Insertion des figures"},
+        {"key": "finalize", "label": "Finalisation et sauvegarde"},
+        {"key": "done", "label": "Terminé"},
+    ])
+
+    # Envoyer la liste des étapes au frontend
+    emit("steps", steps_list, 0)
 
     emit("init", "Initialisation de la génération", 5)
 
@@ -165,21 +346,22 @@ def _generate_docx_sync(
     emit("rag_index", "Construction des index de recherche (RAG)", 25)
     pack_client, pack_admin, pack_mix = build_rag_indexes(text_client, text_admin)
 
-    # 3) Articles
-    emit("articles", "Analyse des articles scientifiques", 35)
+    # 3) Articles (uniquement si fournis)
     text_articles = ""
     articles_texts: List[str] = []
-    for d in articles_pdfs_data:
-        txt = document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
-        text_articles += "\n" + txt
-        articles_texts.append(txt)
+    pack_articles = (None, [], [])
 
-    chunks_art = [c for c in document.chunk_text(text_articles) if c.strip()]
-    if chunks_art:
-        index_art, vectors_art = embeddings.build_index(chunks_art)
-        pack_articles = (index_art, chunks_art, vectors_art)
-    else:
-        pack_articles = (None, [], [])
+    if has_articles:
+        emit("articles", "Analyse des articles scientifiques", 35)
+        for d in articles_pdfs_data:
+            txt = document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
+            text_articles += "\n" + txt
+            articles_texts.append(txt)
+
+        chunks_art = [c for c in document.chunk_text(text_articles) if c.strip()]
+        if chunks_art:
+            index_art, vectors_art = embeddings.build_index(chunks_art)
+            pack_articles = (index_art, chunks_art, vectors_art)
 
     # 4) Generate sections
     emit("sections", "Génération du contenu scientifique", 45)
@@ -252,6 +434,19 @@ def _generate_docx_sync(
         logo_bytes=logo_bytes,
     )
 
+    # 6b) Insert tableau comparatif (CII uniquement)
+    if type_dossier.upper() == "CII" and sections.get("tableau_comparatif"):
+        tableau_data = sections["tableau_comparatif"]
+        if tableau_data.get("elements"):
+            doc = DocxDocument(out_path)
+            writer_tpl.insert_comparison_table(
+                doc,
+                placeholder="[[TABLEAU_COMPARATIF]]",
+                data=tableau_data,
+                client_name=info.societe,
+            )
+            doc.save(out_path)
+
     # 7) Insert figures
     emit("insert_figures", "Insertion des figures dans le document", 85)
     if src_docx_figures:
@@ -268,13 +463,13 @@ def _generate_docx_sync(
     with open(out_path, "rb") as f:
         content = f.read()
 
-    filename = f"{info.projet_name}_{type_dossier}_{info.annee}_VIA.docx"
+    filename = f"{info.societe}_{type_dossier}_{info.annee}_VIA.docx"
     emit("done", "Dossier prêt", 100)
     return content, filename
 
 
 # =========================
-# SSE JOBS: start/events/download
+# SSE JOBS: start/events/download/status
 # =========================
 
 @router.post("/jobs", summary="Démarre une génération asynchrone (retourne un job_id)")
@@ -297,7 +492,11 @@ async def start_generate_job(
     project_id = str(uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
 
-    job = _Job(id=job_id, user_email=user_email, loop=loop)
+    # Créer le job dans Cosmos DB AVANT de commencer
+    _create_job_in_cosmos(job_id, project_id, user_email, created_at)
+
+    # Créer le job en mémoire pour le streaming SSE
+    job = _Job(id=job_id, user_email=user_email, project_id=project_id, loop=loop)
     _JOBS[job_id] = job
 
     async def _read_list(files: List[UploadFile]) -> List[dict]:
@@ -317,9 +516,16 @@ async def start_generate_job(
 
     async def _runner():
         try:
-            def emit(step: str, label: str, percent: int):
-                _log_progress(step, label, percent)
-                job.emit_threadsafe({"type": "progress", "step": step, "label": label, "percent": percent})
+            def emit(step: str, label_or_steps, percent: int):
+                # Cas spécial: envoi de la liste des étapes dynamiques
+                if step == "steps" and isinstance(label_or_steps, list):
+                    job.emit_threadsafe({"type": "steps", "steps": label_or_steps})
+                    return
+                # Cas normal: progression
+                _log_progress(step, label_or_steps, percent)
+                job.emit_threadsafe({"type": "progress", "step": step, "label": label_or_steps, "percent": percent})
+                # Persister la progression dans Cosmos
+                _update_job_progress(job_id, project_id, step, label_or_steps, percent)
 
             content, filename = await anyio.to_thread.run_sync(
                 _generate_docx_sync,
@@ -333,7 +539,7 @@ async def start_generate_job(
             )
 
             # Persist (CRITICAL): guarantees History completeness
-            _persist_generation(
+            persist_result = _persist_generation(
                 project_id=project_id,
                 user_email=user_email,
                 req=req,
@@ -342,14 +548,24 @@ async def start_generate_job(
                 content=content,
             )
 
-            job.result = {"filename": filename, "content": content, "project_id": project_id}
+            blob_url = persist_result["blob_url"]
+
+            # Mettre à jour le job dans Cosmos avec le résultat
+            _complete_job_in_cosmos(job_id, project_id, filename, blob_url)
+
+            job.result = {"filename": filename, "content": content, "project_id": project_id, "blob_url": blob_url}
             job.done = True
             await job.emit({"type": "done", "step": "done", "label": "Dossier prêt", "percent": 100})
 
         except Exception as e:
-            job.error = str(e)
+            error_msg = str(e)
+            job.error = error_msg
             job.done = True
-            await job.emit({"type": "error", "message": str(e), "trace": traceback.format_exc()})
+
+            # Persister l'erreur dans Cosmos
+            _fail_job_in_cosmos(job_id, project_id, error_msg)
+
+            await job.emit({"type": "error", "message": error_msg, "trace": traceback.format_exc()})
         finally:
             async with job.cond:
                 job.cond.notify_all()
@@ -373,9 +589,36 @@ async def generate_job_events(
     Note : EventSource (navigateur) ne supporte pas les headers customs,
     donc on accepte aussi le token en query param.
     """
+    # D'abord chercher en mémoire (job en cours)
     job = _JOBS.get(job_id)
+
     if not job:
-        raise HTTPException(status_code=404, detail="Job introuvable")
+        # Si pas en mémoire, chercher dans Cosmos (job terminé ou sur autre instance)
+        cosmos_job = _find_job_by_id(job_id)
+        if not cosmos_job:
+            raise HTTPException(status_code=404, detail="Job introuvable")
+
+        # Vérifier les permissions
+        if cosmos_job.get("user_email") != current_user.email:
+            raise HTTPException(status_code=403, detail="Accès interdit")
+
+        # Si le job est terminé dans Cosmos, renvoyer le statut final
+        status = cosmos_job.get("status")
+        if status == JobStatus.DONE:
+            async def _stream_done():
+                yield "event: message\n"
+                yield f"data: {json.dumps({'type': 'done', 'step': 'done', 'label': 'Dossier prêt', 'percent': 100}, ensure_ascii=False)}\n\n"
+            return StreamingResponse(_stream_done(), media_type="text/event-stream")
+        elif status == JobStatus.ERROR:
+            async def _stream_error():
+                yield "event: message\n"
+                yield f"data: {json.dumps({'type': 'error', 'message': cosmos_job.get('error_message', 'Erreur inconnue')}, ensure_ascii=False)}\n\n"
+            return StreamingResponse(_stream_error(), media_type="text/event-stream")
+        else:
+            # Job en cours sur une autre instance - on ne peut pas streamer
+            raise HTTPException(status_code=503, detail="Job en cours sur une autre instance. Veuillez réessayer.")
+
+    # Vérifier les permissions pour le job en mémoire
     if job.user_email != current_user.email:
         raise HTTPException(status_code=403, detail="Accès interdit")
 
@@ -402,25 +645,106 @@ async def generate_job_events(
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
+@router.get("/jobs/{job_id}/status", summary="Statut du job (sans SSE)")
+async def get_job_status(
+    job_id: str,
+    current_user: AppUser = Depends(get_current_user)
+):
+    """
+    Récupère le statut d'un job sans streaming SSE.
+    Utile pour vérifier si un job est terminé après une déconnexion.
+    """
+    # D'abord chercher en mémoire
+    job = _JOBS.get(job_id)
+
+    if job:
+        if job.user_email != current_user.email:
+            raise HTTPException(status_code=403, detail="Accès interdit")
+
+        return {
+            "job_id": job_id,
+            "project_id": job.project_id,
+            "status": JobStatus.DONE if job.done else JobStatus.IN_PROGRESS,
+            "error": job.error,
+            "filename": job.result.get("filename") if job.result else None,
+            "blob_url": job.result.get("blob_url") if job.result else None,
+        }
+
+    # Sinon chercher dans Cosmos
+    cosmos_job = _find_job_by_id(job_id)
+    if not cosmos_job:
+        raise HTTPException(status_code=404, detail="Job introuvable")
+
+    if cosmos_job.get("user_email") != current_user.email:
+        raise HTTPException(status_code=403, detail="Accès interdit")
+
+    return {
+        "job_id": job_id,
+        "project_id": cosmos_job.get("project_id"),
+        "status": cosmos_job.get("status"),
+        "progress_percent": cosmos_job.get("progress_percent"),
+        "current_step": cosmos_job.get("current_step"),
+        "current_label": cosmos_job.get("current_label"),
+        "error": cosmos_job.get("error_message"),
+        "filename": cosmos_job.get("filename"),
+        "blob_url": cosmos_job.get("blob_url"),
+        "created_at": cosmos_job.get("created_at"),
+        "updated_at": cosmos_job.get("updated_at"),
+    }
+
+
 @router.get("/jobs/{job_id}/download", summary="Télécharge le DOCX final du job")
 async def download_generate_job(job_id: str, current_user: AppUser = Depends(get_current_user)):
+    # D'abord chercher en mémoire (le plus rapide)
     job = _JOBS.get(job_id)
-    if not job:
+
+    if job:
+        if job.user_email != current_user.email:
+            raise HTTPException(status_code=403, detail="Accès interdit")
+        if not job.done:
+            raise HTTPException(status_code=202, detail="Pas prêt")
+        if job.error:
+            raise HTTPException(status_code=400, detail=job.error)
+        if not job.result:
+            raise HTTPException(status_code=500, detail="Résultat manquant")
+
+        content: bytes = job.result["content"]
+        filename: str = job.result["filename"]
+
+        # Ne plus supprimer le job de la mémoire immédiatement
+        # On le garde pour permettre des re-téléchargements
+        # Le nettoyage se fera via un TTL ou garbage collection
+
+        return Response(
+            content,
+            media_type=DOCX_MIME,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Si pas en mémoire, chercher dans Cosmos DB
+    cosmos_job = _find_job_by_id(job_id)
+    if not cosmos_job:
         raise HTTPException(status_code=404, detail="Job introuvable")
-    if job.user_email != current_user.email:
+
+    if cosmos_job.get("user_email") != current_user.email:
         raise HTTPException(status_code=403, detail="Accès interdit")
-    if not job.done:
+
+    status = cosmos_job.get("status")
+    if status == JobStatus.ERROR:
+        raise HTTPException(status_code=400, detail=cosmos_job.get("error_message", "Erreur"))
+    if status != JobStatus.DONE:
         raise HTTPException(status_code=202, detail="Pas prêt")
-    if job.error:
-        raise HTTPException(status_code=400, detail=job.error)
-    if not job.result:
-        raise HTTPException(status_code=500, detail="Résultat manquant")
 
-    content: bytes = job.result["content"]
-    filename: str = job.result["filename"]
+    blob_url = cosmos_job.get("blob_url")
+    filename = cosmos_job.get("filename")
 
-    # Libération mémoire après download
-    _JOBS.pop(job_id, None)
+    if not blob_url or not filename:
+        raise HTTPException(status_code=500, detail="Résultat manquant dans Cosmos")
+
+    # Télécharger le contenu depuis le blob
+    content = _download_blob_content(blob_url)
+    if not content:
+        raise HTTPException(status_code=500, detail="Impossible de récupérer le fichier")
 
     return Response(
         content,

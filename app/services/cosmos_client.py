@@ -30,3 +30,9 @@ def get_outputs_container():
 def get_users_container():
     db = get_db()
     return db.get_container_client(settings.COSMOS_CONTAINER_USERS)
+
+
+def get_jobs_container():
+    """Conteneur pour la persistance des jobs de génération."""
+    db = get_db()
+    return db.get_container_client(settings.COSMOS_CONTAINER_JOBS)

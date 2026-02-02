@@ -577,10 +577,37 @@ def generate_biblio_section(articles: Optional[List[dict]] = None) -> str:
     uniq.sort(key=lambda x: (x.get("authors") or "").lower())
     return "\n".join(format_iso_690(x) for x in uniq)
 
-def generate_ressources_humaines_from_cvs(cv_texts: List[str]):
-    ctx = "\n\n".join((cv_texts or [])[:5])
+def _parse_rh_json(txt: str) -> List[dict]:
+    """Parse le JSON retourné par l'IA pour les ressources humaines."""
+    import re
+    cleaned = txt.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r'^```(?:json)?\s*\n', '', cleaned)
+        cleaned = re.sub(r'\n```\s*$', '', cleaned)
+
+    start = cleaned.find("[")
+    end = cleaned.rfind("]") + 1
+    if start != -1 and end > start:
+        json_str = cleaned[start:end]
+        personnel = json.loads(json_str)
+
+        # Nettoyer les valeurs "[À compléter par le client]"
+        for person in personnel:
+            for key in list(person.keys()):
+                val = str(person.get(key, ""))
+                if "[" in val and "compléter" in val.lower():
+                    person[key] = ""
+
+        return personnel
+    else:
+        raise ValueError("Pas de tableau JSON trouvé")
+
+
+def _process_cv_batch(cv_batch: List[str], batch_num: int) -> List[dict]:
+    """Traite un batch de CVs et retourne la liste des personnes extraites."""
+    ctx = "\n\n---CV---\n\n".join(cv_batch)
     prompt = f"""
-Tu reçois le contenu brut de CVs. Pour chaque personne, extrais les informations REELLES trouvées dans les CVs.
+Tu reçois le contenu brut de {len(cv_batch)} CV(s). Pour chaque personne, extrais les informations REELLES trouvées dans les CVs.
 
 IMPORTANT: Ne génère PAS de placeholder comme "[À compléter par le client]".
 Si une information n'est PAS présente dans les CVs, utilise une chaîne vide "".
@@ -592,8 +619,8 @@ Renvoie un JSON avec cette structure exacte (tableau de personnes):
     "nom_prenom": "NOM Prénom réel du CV",
     "diplome": "Diplôme le plus élevé trouvé dans le CV ou vide",
     "fonction": "Fonction dans l'opération trouvée dans le CV ou vide",
-    "contribution": "Contribution décrite dans le CV ou vide",
-    "temps": "Temps/heures mentionné dans le CV ou vide"
+    "contribution": "Contribution lié à une activité de recherche ou vide",
+    "temps": "à compléter par le client ou vide "
   }}
 ]
 ```
@@ -603,46 +630,72 @@ CVs:
 
 Renvoie UNIQUEMENT le JSON (tableau), sans texte avant ni après, sans markdown.
 """
-    txt = call_ai(prompt, meta="Ressources humaines")
+    txt = call_ai(prompt, meta=f"Ressources humaines (batch {batch_num})")
 
     try:
-        import re
-        # Nettoyer le texte retourné
-        cleaned = txt.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r'^```(?:json)?\s*\n', '', cleaned)
-            cleaned = re.sub(r'\n```\s*$', '', cleaned)
-
-        # Extraire le JSON
-        start = cleaned.find("[")
-        end = cleaned.rfind("]") + 1
-        if start != -1 and end > start:
-            json_str = cleaned[start:end]
-            personnel = json.loads(json_str)
-
-            # Nettoyer les valeurs "[À compléter par le client]"
-            for person in personnel:
-                for key in list(person.keys()):
-                    val = str(person.get(key, ""))
-                    if "[" in val and "compléter" in val.lower():
-                        person[key] = ""
-
-            return personnel
-        else:
-            raise ValueError("Pas de tableau JSON trouvé")
-
+        return _parse_rh_json(txt)
     except Exception as e:
-        print(f"[RH CIR] Erreur parsing JSON: {e}")
-        print(f"[RH CIR] Contenu reçu: {txt[:200]}...")
-        return [
-            {
-                "nom_prenom": "Erreur parsing",
-                "diplome": "",
-                "fonction": "",
-                "contribution": str(e),
-                "temps": "",
-            }
-        ]
+        print(f"[RH] Erreur parsing JSON batch {batch_num}: {e}")
+        print(f"[RH] Contenu reçu: {txt[:200]}...")
+        return []
+
+
+def generate_ressources_humaines_from_cvs(cv_texts: List[str], max_cvs: int = 10, batch_size: int = 3):
+    """
+    Génère les ressources humaines à partir des CVs.
+
+    Supporte jusqu'à max_cvs (défaut: 10) en les traitant par batch de batch_size (défaut: 3).
+    Cela évite de dépasser les limites de tokens de l'API.
+
+    Args:
+        cv_texts: Liste des textes de CVs extraits
+        max_cvs: Nombre maximum de CVs à traiter (défaut: 10)
+        batch_size: Taille de chaque batch (défaut: 3)
+
+    Returns:
+        Liste des personnes extraites avec leurs informations
+    """
+    if not cv_texts:
+        return []
+
+    # Limiter au maximum configuré
+    cvs_to_process = cv_texts[:max_cvs]
+    total_cvs = len(cvs_to_process)
+
+    print(f"[RH] Traitement de {total_cvs} CV(s) par batch de {batch_size}")
+
+    # Si peu de CVs, traiter en un seul appel
+    if total_cvs <= batch_size:
+        result = _process_cv_batch(cvs_to_process, 1)
+        print(f"[RH] {len(result)} personne(s) extraite(s)")
+        return result
+
+    # Sinon, traiter par batch et fusionner
+    all_personnel = []
+    batch_num = 0
+
+    for i in range(0, total_cvs, batch_size):
+        batch_num += 1
+        batch = cvs_to_process[i:i + batch_size]
+        print(f"[RH] Traitement batch {batch_num}: {len(batch)} CV(s)")
+
+        batch_result = _process_cv_batch(batch, batch_num)
+        all_personnel.extend(batch_result)
+
+    # Dédupliquer par nom (au cas où)
+    seen_names = set()
+    unique_personnel = []
+    for person in all_personnel:
+        name = (person.get("nom_prenom") or "").strip().lower()
+        if name and name not in seen_names:
+            seen_names.add(name)
+            unique_personnel.append(person)
+        elif not name:
+            # Garder les entrées sans nom (erreurs potentielles)
+            unique_personnel.append(person)
+
+    print(f"[RH] Total: {len(unique_personnel)} personne(s) extraite(s) (après dédoublonnage)")
+    return unique_personnel
 
 def evaluateur_travaux(texte: str, *, type_dossier: str = "CIR") -> str:
     libelle = (
