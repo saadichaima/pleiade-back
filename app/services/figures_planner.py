@@ -45,7 +45,7 @@ def _plan_figures_with_llm(
     dossier_type: str,
     sections_payload: Dict[str, str],
     images_meta: List[Dict],
-    max_figures: int = 5,
+    max_figures: int = 10,
 ) -> Optional[Dict]:
     dt = dossier_type.upper()
 
@@ -124,7 +124,7 @@ def _plan_figures_with_llm(
 
 
 
-def _semantic_filter_images(images_meta: List[Dict], *, target_keep: int = 5) -> List[Dict]:
+def _semantic_filter_images(images_meta: List[Dict], *, target_keep: int = 10) -> List[Dict]:
     """
     Garde suffisamment d'images candidates pour permettre au planner
     d'en choisir plusieurs figures (ex: 4).
@@ -195,9 +195,9 @@ def _prepare_figures_for_dossier(
     docs_client_data: List[Dict[str, bytes]],
     sections: Dict[str, str],
     section_keys_for_figures: List[str],
-    max_figures: int = 5,
+    max_figures: int = 10,
     min_side: int = 400,
-    max_images_candidates: int = 40,
+    max_images_candidates: int = 20,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Pipeline générique CIR/CII :
@@ -414,9 +414,9 @@ def _prepare_figures_for_dossier(
 def prepare_figures_for_cir(
     docs_client_data: List[Dict[str, bytes]],
     sections_cir: Dict[str, str],
-    max_figures: int = 5,
+    max_figures: int = 10,
     min_side: int = 300,
-    max_images_candidates: int = 10,  # Limite à 10 images max pour éviter les timeouts
+    max_images_candidates: int = 20,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Spécifique CIR : on travaille sur les sections
@@ -439,9 +439,9 @@ def prepare_figures_for_cir(
 def prepare_figures_for_cii(
     docs_client_data: List[Dict[str, bytes]],
     sections_cii: Dict[str, str],
-    max_figures: int = 5,
+    max_figures: int = 10,
     min_side: int = 300,
-    max_images_candidates: int = 10,  # Limite à 10 images max pour éviter les timeouts
+    max_images_candidates: int = 20,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Spécifique CII : on travaille sur les sections
