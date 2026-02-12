@@ -101,3 +101,143 @@ def search_articles_serper(
     # Ordonner globalement par citations décroissantes
     results.sort(key=lambda x: x["citations"], reverse=True)
     return results
+
+
+# --------------- Recherche de sites web concurrents ---------------
+
+def search_competitor_website(name: str, timeout: int = 10) -> str:
+    """
+    Cherche le site officiel d'un concurrent via Google Search (Serper).
+    Retourne l'URL du domaine principal ou '' si non trouvé.
+    """
+    if not SERPER_API_KEY:
+        return ""
+
+    url = "https://google.serper.dev/search"
+    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+    payload = {"q": f"{name} site officiel", "num": 5, "gl": "fr", "hl": "fr"}
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[Serper Web] Erreur recherche '{name}': {e}")
+        return ""
+
+    organic = (r.json() or {}).get("organic", []) or []
+    if not organic:
+        print(f"[Serper Web] Aucun résultat pour '{name}'")
+        return ""
+
+    # Prendre le premier résultat organique
+    link = (organic[0].get("link") or "").strip()
+    print(f"[Serper Web] '{name}' → {link}")
+    return link
+
+
+def search_competitors_websites(names: List[str], timeout: int = 10) -> Dict[str, str]:
+    """
+    Cherche les sites officiels de plusieurs concurrents en parallèle.
+    Retourne un dict {nom: url}.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not SERPER_API_KEY or not names:
+        return {n: "" for n in names}
+
+    result: Dict[str, str] = {}
+    max_workers = min(len(names), 5)
+
+    def _search(name: str) -> tuple:
+        return name, search_competitor_website(name, timeout=timeout)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for name, url in pool.map(lambda n: _search(n), names):
+            result[name] = url
+
+    return result
+
+
+# --------------- Recherche directe de concurrents via Google ---------------
+
+def search_competitors_from_serper(
+    societe: str,
+    projet: str,
+    secteur_keywords: str = "",
+    max_results: int = 10,
+    timeout: int = 15,
+) -> List[Dict[str, str]]:
+    """
+    Cherche directement des concurrents sur Google via Serper.
+    Fait 2 requêtes avec des angles différents pour maximiser la couverture,
+    puis déduplique par domaine.
+
+    Retourne une liste de dicts: [{"name": ..., "site": ..., "snippet": ...}]
+    """
+    if not SERPER_API_KEY:
+        return []
+
+    url = "https://google.serper.dev/search"
+    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+
+    # 2 requêtes complémentaires pour couvrir large
+    queries = [
+        f"{projet} concurrents alternatives solutions",
+        f"{societe} {projet} competitors marché",
+    ]
+    if secteur_keywords:
+        queries.append(f"{secteur_keywords} solutions logiciels entreprises")
+
+    seen_domains: set = set()
+    results: List[Dict[str, str]] = []
+
+    for q in queries:
+        payload = {"q": q, "num": 10, "gl": "fr", "hl": "fr"}
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            r.raise_for_status()
+            data = r.json() or {}
+        except Exception as e:
+            print(f"[Serper Competitors] Erreur pour '{q}': {e}")
+            continue
+
+        for item in data.get("organic", []) or []:
+            link = (item.get("link") or "").strip()
+            title = (item.get("title") or "").strip()
+            snippet = (item.get("snippet") or "").strip()
+            if not link or not title:
+                continue
+
+            # Extraire le domaine pour dédupliquer
+            from urllib.parse import urlparse
+            domain = urlparse(link).netloc.lower().replace("www.", "")
+
+            # Ignorer le site du client lui-même
+            client_domain = urlparse(f"https://{societe.lower().replace(' ', '')}.com").netloc
+            if domain == client_domain:
+                continue
+
+            # Ignorer les sites généralistes (wikipedia, linkedin, comparateurs génériques)
+            skip_domains = {
+                "wikipedia.org", "linkedin.com", "facebook.com", "twitter.com",
+                "youtube.com", "reddit.com", "quora.com", "medium.com",
+                "amazon.com", "amazon.fr",
+            }
+            if any(sd in domain for sd in skip_domains):
+                continue
+
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+
+            results.append({
+                "name": title,
+                "site": link,
+                "snippet": snippet,
+            })
+
+        if len(results) >= max_results:
+            break
+
+    print(f"[Serper Competitors] {len(results)} concurrents trouvés pour '{projet}'")
+    return results[:max_results]

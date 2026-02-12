@@ -357,12 +357,30 @@ def gen_analyse(
             lines.append(line)
         liste_concurrents = "\n".join(lines) if lines else "- Aucun concurrent renseigné."
 
+    # Construire un bloc dédié avec le contenu scrapé des sites concurrents
+    scraped_sections = []
+    for cpt in concurrents:
+        name = (cpt.get("name") or "").strip()
+        content = (cpt.get("website_content") or "").strip()
+        if name and content:
+            scraped_sections.append(
+                f"=== Contenu du site web de {name} ===\n{content}"
+            )
+    contenu_sites_concurrents = ""
+    if scraped_sections:
+        contenu_sites_concurrents = (
+            "\n\nINFORMATIONS EXTRAITES DES SITES WEB DES CONCURRENTS :\n"
+            "Utilise ces informations réelles pour enrichir et justifier ton analyse comparative.\n\n"
+            + "\n\n".join(scraped_sections)
+        )
+
     instr = _build(
         _tmpl_cii("analyse"),
         concurrents_selectionnes=concurrents_json,       # JSON complet
         liste_concurrents=liste_concurrents,             # chaîne lisible
         axes_cibles=", ".join(axes_cibles),
         performance_type=performance_type,
+        contenu_sites_concurrents=contenu_sites_concurrents,  # contenu scrapé
     )
 
     raw=generate_section_with_rag(
@@ -601,6 +619,28 @@ def generate_tableau_comparatif(
 
     competitors_list = ", ".join(competitors_names)
 
+    # Construire un bloc avec les infos détaillées des concurrents (contenu scrapé + weaknesses)
+    scraped_info_lines = []
+    for comp in competitors:
+        name = (comp.get("name") or "").strip()
+        content = (comp.get("website_content") or "").strip()
+        weakness = (comp.get("weakness") or "").strip()
+        if name and (content or weakness):
+            block = f"--- {name} ---"
+            if weakness:
+                block += f"\nLimite connue: {weakness}"
+            if content:
+                block += f"\nContenu extrait du site web:\n{content}"
+            scraped_info_lines.append(block)
+
+    scraped_section = ""
+    if scraped_info_lines:
+        scraped_section = (
+            "\n\nINFORMATIONS DÉTAILLÉES SUR LES CONCURRENTS (extraites de leurs sites web):\n"
+            + "\n\n".join(scraped_info_lines)
+            + "\n"
+        )
+
     prompt = f"""Tu es un expert en analyse concurrentielle pour dossiers CII (Crédit Impôt Innovation).
 
 CONTEXTE:
@@ -613,7 +653,7 @@ SECTION TRAVAUX DU DOSSIER:
 
 SECTION ANALYSE CONCURRENTIELLE:
 {section_concurrence[:8000]}
-
+{scraped_section}
 TÂCHE:
 1. Extrais les 5 à 8 éléments/fonctionnalités clés qui différencient le projet "{projet}" de la société "{societe}"
 2. Pour chaque élément, évalue si le client et chaque concurrent le possède

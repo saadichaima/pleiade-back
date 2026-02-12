@@ -206,3 +206,32 @@ def validate_url(url: str) -> bool:
         return all([parsed.scheme in ["http", "https"], parsed.netloc])
     except Exception:
         return False
+
+
+def check_url_accessible(url: str, timeout: int = 5) -> bool:
+    """
+    Vérifie qu'une URL est réellement accessible via un HEAD request.
+
+    Args:
+        url: URL à vérifier
+        timeout: Timeout en secondes
+
+    Returns:
+        True si l'URL répond avec un status < 400, False sinon
+    """
+    if not validate_url(url):
+        return False
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        r = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if r.status_code < 400:
+            return True
+        # Certains sites bloquent HEAD, tenter GET
+        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True, stream=True)
+        r.close()
+        return r.status_code < 400
+    except Exception:
+        return False
