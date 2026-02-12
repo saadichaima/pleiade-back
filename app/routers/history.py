@@ -1,9 +1,10 @@
 # app/routers/history.py
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.auth_ms import get_current_user, require_admin
+from app.auth_ms import get_current_user, require_admin, require_manager
 from app.models.auth import AppUser
 from app.services.cosmos_client import get_projects_container, get_outputs_container
+from app.services.teams_service import get_team_by_manager
 from app.config import settings
 
 router = APIRouter()
@@ -99,4 +100,80 @@ def all_history(_: AppUser = Depends(require_admin)):
         enable_cross_partition_query=True,
     )
     enriched = _attach_output_meta(items, user_filter=None)
+    return {"items": enriched}
+
+
+@router.get("/history/team")
+def team_history(user: AppUser = Depends(require_manager)):
+    """
+    Récupère l'historique de tous les projets des membres de l'équipe du manager.
+    """
+    # Récupérer l'équipe du manager
+    team = get_team_by_manager(user.email)
+    if not team:
+        raise HTTPException(
+            status_code=404,
+            detail="Vous n'êtes assigné à aucune équipe en tant que manager."
+        )
+
+    # Récupérer tous les projets des membres de l'équipe
+    projects_container = get_projects_container()
+
+    # Construire la liste des emails (membres + manager lui-même)
+    all_emails = team.members + [user.email]
+
+    if not all_emails:
+        return {"items": []}
+
+    # Query avec IN clause
+    placeholders = ", ".join([f"@email{i}" for i in range(len(all_emails))])
+    query = f"""
+    SELECT c.id, c.project_id, c.created_at, c.type_dossier,
+           c.user_id,
+           c.payload.info.societe AS societe,
+           c.payload.info.projet_name AS projet,
+           c.payload.info.annee AS annee
+    FROM c
+    WHERE c.user_id IN ({placeholders})
+    ORDER BY c.created_at DESC
+    """
+
+    parameters = [
+        {"name": f"@email{i}", "value": email}
+        for i, email in enumerate(all_emails)
+    ]
+
+    items = projects_container.query_items(
+        query=query,
+        parameters=parameters,
+        enable_cross_partition_query=True,
+    )
+
+    enriched = _attach_output_meta(items, user_filter=None)
+    return {"items": enriched}
+
+
+@router.get("/history/user/{user_email}")
+def user_history(user_email: str, _: AppUser = Depends(require_admin)):
+    """
+    Récupère l'historique d'un utilisateur spécifique.
+    Accessible uniquement par les admins.
+    """
+    projects_container = get_projects_container()
+    query = """
+    SELECT c.id, c.project_id, c.created_at, c.type_dossier,
+           c.user_id,
+           c.payload.info.societe AS societe,
+           c.payload.info.projet_name AS projet,
+           c.payload.info.annee AS annee
+    FROM c
+    WHERE c.user_id = @uid
+    ORDER BY c.created_at DESC
+    """
+    items = projects_container.query_items(
+        query=query,
+        parameters=[{"name": "@uid", "value": user_email}],
+        enable_cross_partition_query=True,
+    )
+    enriched = _attach_output_meta(items, user_filter=user_email)
     return {"items": enriched}

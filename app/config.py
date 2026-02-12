@@ -50,6 +50,8 @@ class Settings(BaseModel):
     COSMOS_CONTAINER_PROJECTS: str = os.getenv("COSMOS_CONTAINER_PROJECTS", "projects")
     COSMOS_CONTAINER_DOCUMENTS: str = os.getenv("COSMOS_CONTAINER_DOCUMENTS", "documents")
     COSMOS_CONTAINER_OUTPUTS: str = os.getenv("COSMOS_CONTAINER_OUTPUTS", "outputs")
+    COSMOS_CONTAINER_USERS: str = os.getenv("COSMOS_CONTAINER_USERS", "users")
+    COSMOS_CONTAINER_TEAMS: str = os.getenv("COSMOS_CONTAINER_TEAMS", "teams")
 
     # ===== Azure Blob Storage pour les fichiers client & sorties =====
     # Option 1 : connection string complète (recommandé)

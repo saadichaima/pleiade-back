@@ -2,15 +2,15 @@
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import health, keywords, articles, generate, cii, auth_ms, history
+from app.routers import health, keywords, articles, generate, cii, cir, auth_ms, history, admin_prompts, teams, admin_templates
 from fastapi.openapi.utils import get_openapi
 import json, os
-from app.routers import auth_ms, history
 
 
 openapi_tags = [
-    {"name": "nlp", "description": "Extraction de mots-clés et recherche d’articles (Serper/Scholar)."},
+    {"name": "nlp", "description": "Extraction de mots-clés et recherche d'articles (Serper/Scholar)."},
     {"name": "cii", "description": "Analyses concurrentielles CII (prompt + LLM)."},
+    {"name": "cir", "description": "Fonctionnalités CIR : suggestion d'articles scientifiques via mots-clés."},
     {"name": "generate", "description": "Génération de documents DOCX (CIR/CII)."},
 ]
 
@@ -46,9 +46,13 @@ app.include_router(health.router)
 app.include_router(keywords.router, prefix="/nlp", tags=["nlp"])
 app.include_router(articles.router, prefix="/nlp", tags=["nlp"])
 app.include_router(cii.router,      prefix="/cii", tags=["cii"])
+app.include_router(cir.router,      prefix="/cir", tags=["cir"])
 app.include_router(generate.router, prefix="/generate", tags=["generate"])
 app.include_router(auth_ms.router,  tags=["auth"])
 app.include_router(history.router,  tags=["history"])
+app.include_router(admin_prompts.router, tags=["admin"])
+app.include_router(admin_templates.router, tags=["admin"])
+app.include_router(teams.router, tags=["teams"])
 
 # debug: afficher les routes au démarrage
 @app.on_event("startup")

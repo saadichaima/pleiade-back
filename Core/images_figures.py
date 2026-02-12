@@ -335,6 +335,285 @@ def _max_text_width_emu(doc: Document) -> int:
 
 
 # ==========================
+# Champs Word (SEQ, REF, Bookmarks) pour vraies légendes
+# ==========================
+
+def _create_seq_field(seq_name: str = "Figure", initial_value: int = 1) -> OxmlElement:
+    """
+    Crée un champ SEQ Word pour la numérotation automatique.
+    Génère: <w:fldSimple w:instr=" SEQ Figure \* ARABIC "><w:r><w:t>N</w:t></w:r></w:fldSimple>
+
+    initial_value: Valeur affichée par défaut (sera recalculée par Word avec F9)
+    """
+    fld = OxmlElement("w:fldSimple")
+    fld.set(qn("w:instr"), f" SEQ {seq_name} \\* ARABIC ")
+    # Valeur par défaut (sera mise à jour par Word)
+    r = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    t.text = str(initial_value)
+    r.append(t)
+    fld.append(r)
+    return fld
+
+
+def _create_bookmark_start(bookmark_id: int, bookmark_name: str) -> OxmlElement:
+    """Crée un élément w:bookmarkStart."""
+    bm_start = OxmlElement("w:bookmarkStart")
+    bm_start.set(qn("w:id"), str(bookmark_id))
+    bm_start.set(qn("w:name"), bookmark_name)
+    return bm_start
+
+
+def _create_bookmark_end(bookmark_id: int) -> OxmlElement:
+    """Crée un élément w:bookmarkEnd."""
+    bm_end = OxmlElement("w:bookmarkEnd")
+    bm_end.set(qn("w:id"), str(bookmark_id))
+    return bm_end
+
+
+def _create_ref_field(bookmark_name: str, caption_label: str = "Figure", display_num: int = 1) -> OxmlElement:
+    """
+    Crée un champ REF qui pointe vers un signet.
+    Le flag \h crée un hyperlien.
+
+    display_num: Numéro affiché par défaut (sera recalculé par Word avec F9)
+    """
+    fld = OxmlElement("w:fldSimple")
+    fld.set(qn("w:instr"), f" REF {bookmark_name} \\h ")
+    r = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    t.text = f"{caption_label} {display_num}"
+    r.append(t)
+    fld.append(r)
+    return fld
+
+
+def _get_next_bookmark_id(doc: Document) -> int:
+    """
+    Trouve le prochain ID de signet disponible dans le document.
+    Les IDs doivent être uniques dans tout le document.
+    """
+    max_id = 0
+    try:
+        for bm in doc._element.xpath("//w:bookmarkStart"):
+            try:
+                bm_id = int(bm.get(qn("w:id")) or 0)
+                if bm_id > max_id:
+                    max_id = bm_id
+            except (ValueError, TypeError):
+                pass
+    except Exception:
+        pass
+    return max_id + 1
+
+
+def _add_caption_with_seq(
+    doc: Document,
+    after_p_elm,
+    fig_num: int,
+    caption_text: str,
+    caption_label: str = "Figure",
+    caption_style: str = "Caption",
+    nbsp: str = "\u202F",
+    seq_name: str = "Figure",
+    seq_order: int = None,
+) -> tuple:
+    """
+    Ajoute une légende avec un vrai champ SEQ et un signet pour les références croisées.
+
+    Structure générée:
+    <w:p>
+      <w:bookmarkStart w:id="X" w:name="_Ref_Figure_N"/>
+      <w:r><w:t>Figure </w:t></w:r>
+      <w:fldSimple w:instr=" SEQ Figure \* ARABIC ">...</w:fldSimple>
+      <w:bookmarkEnd w:id="X"/>
+      <w:r><w:t> : Légende</w:t></w:r>
+    </w:p>
+
+    seq_order: Numéro d'ordre réel d'insertion (utilisé pour la valeur par défaut du SEQ)
+
+    Retourne (bookmark_name, bookmark_id, seq_order) pour les références croisées.
+    """
+    # Utiliser seq_order si fourni, sinon fig_num
+    display_num = seq_order if seq_order is not None else fig_num
+
+    # Créer le paragraphe de légende
+    cap_p = _insert_paragraph_after_live(after_p_elm)
+    para_cap = Paragraph(cap_p, doc._body)
+
+    # Appliquer le style
+    try:
+        if caption_style:
+            para_cap.style = caption_style
+    except Exception:
+        pass
+
+    para_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Générer un nom de signet unique (basé sur fig_num pour le mapping)
+    bookmark_name = f"_Ref_{seq_name}_{fig_num}"
+    bookmark_id = _get_next_bookmark_id(doc)
+
+    # 1. Ajouter le bookmarkStart
+    bm_start = _create_bookmark_start(bookmark_id, bookmark_name)
+    cap_p.append(bm_start)
+
+    # 2. Ajouter "Figure " (texte avant le numéro)
+    r1 = OxmlElement("w:r")
+    t1 = OxmlElement("w:t")
+    t1.set(qn("xml:space"), "preserve")
+    t1.text = f"{caption_label} "
+    r1.append(t1)
+    cap_p.append(r1)
+
+    # 3. Ajouter le champ SEQ (numéro automatique) avec la bonne valeur initiale
+    seq_field = _create_seq_field(seq_name, initial_value=display_num)
+    cap_p.append(seq_field)
+
+    # 4. Ajouter le bookmarkEnd
+    bm_end = _create_bookmark_end(bookmark_id)
+    cap_p.append(bm_end)
+
+    # 5. Ajouter " : Légende"
+    r2 = OxmlElement("w:r")
+    t2 = OxmlElement("w:t")
+    t2.set(qn("xml:space"), "preserve")
+    t2.text = f"{nbsp}:{nbsp}{caption_text}"
+    r2.append(t2)
+    cap_p.append(r2)
+
+    return bookmark_name, bookmark_id, cap_p, display_num
+
+
+def _replace_text_ref_with_field(
+    p_elm,
+    fig_num: int,
+    bookmark_name: str,
+    caption_label: str = "Figure",
+    display_num: int = None,
+) -> int:
+    """
+    Remplace les occurrences de "cf. Figure N" ou "voir Figure N" dans un paragraphe
+    par un champ REF pointant vers le signet.
+
+    fig_num: Numéro original de la figure (utilisé pour la détection)
+    display_num: Numéro réel à afficher (ordre d'insertion)
+
+    Retourne le nombre de remplacements effectués.
+    """
+    # Utiliser display_num si fourni, sinon fig_num
+    actual_display_num = display_num if display_num is not None else fig_num
+
+    # Pattern pour détecter les références
+    REF_PATTERN = re.compile(
+        rf"(?i)((?:cf\.\s*|voir\s+))({re.escape(caption_label)}|fig(?:\.|ure)?|image)\s*[:\-–]?\s*{fig_num}\b"
+    )
+
+    replaced_count = 0
+
+    try:
+        t_elements = list(p_elm.xpath(".//*[local-name()='t']"))
+    except Exception:
+        return 0
+
+    for t_el in t_elements:
+        text = t_el.text or ""
+        if not text:
+            continue
+
+        match = REF_PATTERN.search(text)
+        if not match:
+            continue
+
+        # On a trouvé une référence à remplacer
+        prefix = match.group(1)  # "cf. " ou "voir "
+
+        # Récupérer le w:r parent
+        r_parent = t_el.getparent()
+        if r_parent is None or r_parent.tag != qn("w:r"):
+            continue
+
+        # Position dans le paragraphe
+        p_parent = r_parent.getparent()
+        if p_parent is None:
+            continue
+
+        r_index = list(p_parent).index(r_parent)
+
+        # Texte avant et après la référence
+        text_before = text[:match.start()]
+        text_after = text[match.end():]
+
+        # Supprimer l'ancien run
+        p_parent.remove(r_parent)
+
+        insert_pos = r_index
+
+        # 1. Ajouter le texte avant + préfixe (cf. ou voir)
+        if text_before or prefix:
+            r_before = OxmlElement("w:r")
+            t_before = OxmlElement("w:t")
+            t_before.set(qn("xml:space"), "preserve")
+            t_before.text = text_before + prefix
+            r_before.append(t_before)
+            p_parent.insert(insert_pos, r_before)
+            insert_pos += 1
+
+        # 2. Ajouter le champ REF avec le bon numéro d'affichage
+        ref_field = _create_ref_field(bookmark_name, caption_label, actual_display_num)
+        p_parent.insert(insert_pos, ref_field)
+        insert_pos += 1
+
+        # 3. Ajouter le texte après
+        if text_after:
+            r_after = OxmlElement("w:r")
+            t_after = OxmlElement("w:t")
+            t_after.set(qn("xml:space"), "preserve")
+            t_after.text = text_after
+            r_after.append(t_after)
+            p_parent.insert(insert_pos, r_after)
+
+        replaced_count += 1
+        # On ne traite qu'une occurrence par élément t pour éviter les problèmes d'index
+        break
+
+    return replaced_count
+
+
+def _replace_all_refs_in_doc(
+    doc: Document,
+    bookmark_map: dict,
+    caption_label: str = "Figure",
+) -> int:
+    """
+    Parcourt tout le document et remplace toutes les références textuelles
+    par des champs REF.
+
+    bookmark_map: {fig_num: (bookmark_name, display_num)}
+
+    Retourne le nombre total de remplacements.
+    """
+    total_replaced = 0
+
+    # On fait plusieurs passes car le remplacement peut fragmenter le texte
+    max_passes = 5
+    for _ in range(max_passes):
+        pass_replaced = 0
+        for p in _iter_all_paragraphs_doc(doc):
+            for fig_num, (bookmark_name, display_num) in bookmark_map.items():
+                count = _replace_text_ref_with_field(
+                    p._p, fig_num, bookmark_name, caption_label, display_num
+                )
+                pass_replaced += count
+
+        if pass_replaced == 0:
+            break
+        total_replaced += pass_replaced
+
+    return total_replaced
+
+
+# ==========================
 # Helpers légendes
 # ==========================
 
@@ -464,12 +743,19 @@ def insert_images_by_reference_live(
     renumber_references: bool = False,
     target_label: str = "Figure",
     remove_orphan_references: bool = True,
+    use_word_fields: bool = True,
 ) -> str:
     """
     Insère les images juste après le paragraphe qui contient une référence
     de type 'cf. Figure N' ou 'voir Figure N'.
 
     Si remove_orphan_references=True, supprime les références sans image correspondante.
+
+    Si use_word_fields=True (défaut), utilise de vrais champs Word :
+    - Légendes avec champ SEQ pour numérotation automatique
+    - Signets (bookmarks) sur les légendes
+    - Champs REF pour les références croisées dans le texte
+    Cela permet la mise à jour automatique des numéros avec Ctrl+A puis F9.
     """
     print(
         f"[images_figures] insert_images_by_reference_live: src={src_docx}, "
@@ -496,6 +782,9 @@ def insert_images_by_reference_live(
     inserted_count = 0
     missing_count = 0
     seen_refs: set[int] = set()
+    seq_counter = 0  # Compteur d'ordre réel d'insertion
+    # {fig_num: (bookmark_name, display_num)} pour les champs REF
+    bookmark_map: Dict[int, tuple] = {}
 
     def _host_paragraph_text(p: Paragraph) -> str:
         try:
@@ -543,20 +832,50 @@ def insert_images_by_reference_live(
             new_img_p = _insert_paragraph_after_live(p._p)
             _add_picture_to_paragraph_live(docB, new_img_p, img_bytes, width_emu)
 
+            # Incrémenter le compteur d'ordre AVANT d'ajouter la légende
+            seq_counter += 1
+
             cap_txt = _caption_for_num(captions_text, fig_num)
             if cap_txt:
-                cap_p = _insert_paragraph_after_live(new_img_p)
-                para_cap = Paragraph(cap_p, docB._body)
-                try:
-                    if caption_style:
-                        para_cap.style = caption_style
-                except Exception:
-                    pass
-                para_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                para_cap.add_run().text = f"{caption_label} {fig_num}{nbsp}:{nbsp}{cap_txt}"
+                if use_word_fields:
+                    # Utiliser les vrais champs Word (SEQ + bookmark)
+                    # seq_order = numéro réel d'insertion (pas le numéro IA)
+                    bookmark_name, _bm_id, _cap_p, display_num = _add_caption_with_seq(
+                        doc=docB,
+                        after_p_elm=new_img_p,
+                        fig_num=fig_num,
+                        caption_text=cap_txt,
+                        caption_label=caption_label,
+                        caption_style=caption_style,
+                        nbsp=nbsp,
+                        seq_name=caption_label,
+                        seq_order=seq_counter,
+                    )
+                    # Stocker le bookmark ET le numéro réel pour les références
+                    bookmark_map[fig_num] = (bookmark_name, display_num)
+                else:
+                    # Ancien comportement : texte brut
+                    cap_p = _insert_paragraph_after_live(new_img_p)
+                    para_cap = Paragraph(cap_p, docB._body)
+                    try:
+                        if caption_style:
+                            para_cap.style = caption_style
+                    except Exception:
+                        pass
+                    para_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    para_cap.add_run().text = f"{caption_label} {fig_num}{nbsp}:{nbsp}{cap_txt}"
 
             inserted_for_num.add(fig_num)
             inserted_count += 1
+
+    # Remplacement des références textuelles par des champs REF (si use_word_fields)
+    refs_replaced_count = 0
+    if use_word_fields and bookmark_map:
+        refs_replaced_count = _replace_all_refs_in_doc(docB, bookmark_map, caption_label)
+        print(
+            f"[images_figures] Références remplacées par champs REF: {refs_replaced_count} "
+            f"(figures: {sorted(bookmark_map.keys())})"
+        )
 
     # Nettoyage des références orphelines si activé
     orphan_removed_count = 0
@@ -571,6 +890,7 @@ def insert_images_by_reference_live(
     print(
         f"[images_figures] terminé. Références vues: {sorted(seen_refs) if seen_refs else 'aucune'}, "
         f"images insérées: {inserted_count}, références sans image: {missing_count}, "
+        f"références remplacées par REF: {refs_replaced_count}, "
         f"références orphelines nettoyées: {orphan_removed_count}"
     )
     return out_docx

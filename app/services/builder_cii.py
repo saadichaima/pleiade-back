@@ -1,8 +1,67 @@
 # app/services/builder_cii.py
-from typing import Dict, Any
+from typing import Dict, Any, Callable, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from Core import rag_cii
 from Core import rag
- 
+from app.services.web_scraper import scrape_website, validate_url
+
+
+def _truncate_content(text: str, max_words: int = 500) -> str:
+    """Tronque le contenu scrapé à max_words pour contrôler la taille du prompt."""
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]) + " [...]"
+
+
+def _scrape_competitors_parallel(
+    concurrents_simpl: list,
+    max_words_per_competitor: int = 500,
+    timeout_per_site: int = 10,
+) -> list:
+    """
+    Scrape les sites web des concurrents en parallèle.
+    Ajoute le champ 'website_content' à chaque dict concurrent.
+    """
+    tasks = []
+    for idx, cpt in enumerate(concurrents_simpl):
+        url = (cpt.get("website") or "").strip()
+        if url and validate_url(url):
+            tasks.append((idx, url))
+        else:
+            cpt["website_content"] = ""
+
+    if not tasks:
+        print("[SCRAPE COMPETITORS] Aucune URL valide à scraper")
+        return concurrents_simpl
+
+    print(f"[SCRAPE COMPETITORS] Scraping de {len(tasks)} site(s) concurrent(s) en parallèle...")
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(len(tasks), 5)) as executor:
+        future_to_idx = {
+            executor.submit(scrape_website, url, 1, timeout_per_site): idx
+            for idx, url in tasks
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                raw_content = future.result()
+                results[idx] = _truncate_content(raw_content, max_words_per_competitor)
+            except Exception as e:
+                print(f"[SCRAPE COMPETITORS] Erreur scraping concurrent {idx}: {e}")
+                results[idx] = ""
+
+    for idx, url in tasks:
+        concurrents_simpl[idx]["website_content"] = results.get(idx, "")
+
+    scraped_count = sum(1 for v in results.values() if v)
+    print(f"[SCRAPE COMPETITORS] {scraped_count}/{len(tasks)} site(s) scrapé(s) avec succès")
+
+    return concurrents_simpl
+
 
 def build_sections_cii(
     index_client_pack,   # (index, chunks, vectors) pour docs techniques
@@ -17,6 +76,7 @@ def build_sections_cii(
     visee_generale: str = "",
     performance_type: str = "",
     doc_complete: bool = False,
+    emit: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     (i,  c,  v)  = index_client_pack
     (im, cm, vm) = index_mix_pack
@@ -67,6 +127,11 @@ def build_sections_cii(
         for x in (concurrents or [])
     ]
 
+    # --- Scraper les sites web des concurrents en parallèle ---
+    if emit:
+        emit("scraping_competitors", "Analyse des sites web concurrents", 42)
+    concurrents_simpl = _scrape_competitors_parallel(concurrents_simpl)
+
     lines = []
     for cpt in concurrents_simpl:
         name = (cpt.get("name") or "").strip()
@@ -76,6 +141,7 @@ def build_sections_cii(
         axes_str = ", ".join(cpt.get("axes") or [])
         weakness = (cpt.get("weakness") or "").strip()
         adv = (cpt.get("client_advantage") or "").strip()
+        web_content = (cpt.get("website_content") or "").strip()
 
         line = f"- {name}"
         if website:
@@ -86,6 +152,8 @@ def build_sections_cii(
             line += f"\n  Limite du concurrent: {weakness}"
         if adv:
             line += f"\n  Avantage du projet client: {adv}"
+        if web_content:
+            line += f"\n  Contenu extrait du site web:\n  {web_content}"
         lines.append(line)
 
     liste_concurrents = "\n".join(lines) if lines else "- Aucun concurrent renseigné."

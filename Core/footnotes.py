@@ -14,14 +14,23 @@ L’IA est appelée via Core.rag.call_ai.
 """
 
 import json
+import os
 import re
 import zipfile
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict
+from urllib.parse import urlparse
+
+import requests
 from app.services.prompts import prompt_footnotes_glossary
+from dotenv import load_dotenv
 from lxml import etree
 
 from Core import rag  # même module que pour les autres appels LLM
+
+load_dotenv()
+_SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
 
 # =======================
 # Namespaces / constantes
@@ -486,48 +495,264 @@ def insert_footnotes(docx_path: str, glossary: Dict[str, str], out_path: str = N
 # URLs -> notes de bas de page
 # =======================
 _URL_RE = re.compile(
-    r"(?:<(?P<angle>https?://[^>\s]+)>)"          # <https://...>
-    r"|(?:\((?P<paren>https?://[^)\s]+)\))"       # (https://...)
-    r"|(?:\[(?P<brack>https?://[^\]\s]+)\])"      # [https://...]
-    r"|(?P<bare>https?://[^\s\]\)\>]+?)(?="
-    r"(?:[.,;:!?\u2026\u00BB](?:\s|$))"           # ponctuation terminale après l’URL
-    r"|(?:[\s\]\)\>]|$)"                          # ou espace / ] / ) / > / fin de texte
-    r")",
+    r"(?:<(?P<angle>https?://[^>\s]+)>)"             # <https://...>
+    r"|(?:\((?P<paren>https?://[^)\s]+)\))"          # (https://...)
+    r"|(?:\[(?P<brack>https?://[^\]\s]+)\])"         # [https://...]
+    r"|(?P<bare>https?://[^\s<>\"'\u00AB\u00BB]+)",  # bare URL : greedy, arrêt sur espace/guillemets
     re.IGNORECASE,
 )
 
-_TAIL_PUNCT = ",.;:!?…»"
+_TAIL_PUNCT = set(",.;:!?\u2026\u00BB\u201D\u201C'\"")
+
+
+def _strip_url_tail(url: str) -> tuple:
+    """Supprime la ponctuation terminale d'une URL bare, en respectant les parenthèses équilibrées.
+
+    Retourne (url_nettoyée, nombre_de_caractères_supprimés).
+    """
+    stripped = 0
+    while url:
+        last = url[-1]
+        if last in _TAIL_PUNCT:
+            url = url[:-1]
+            stripped += 1
+            continue
+        # Parenthèse fermante non équilibrée → supprimer
+        if last == ')' and url.count('(') < url.count(')'):
+            url = url[:-1]
+            stripped += 1
+            continue
+        # Crochet fermant non équilibré → supprimer
+        if last == ']' and url.count('[') < url.count(']'):
+            url = url[:-1]
+            stripped += 1
+            continue
+        break
+    return url, stripped
 
 
 def _first_url_in_text(s: str):
+    """Trouve la première URL dans la chaîne *s*.
+
+    Retourne (nom_du_groupe, début, fin, url_nettoyée) ou None.
+    début/fin correspondent au span complet dans *s* (délimiteurs inclus pour angle/paren/brack).
+    """
     if not s:
         return None
     m = _URL_RE.search(s)
     if not m:
         return None
     grp = (
-        "angle"
-        if m.group("angle")
-        else "paren"
-        if m.group("paren")
-        else "brack"
-        if m.group("brack")
+        "angle"  if m.group("angle")
+        else "paren" if m.group("paren")
+        else "brack" if m.group("brack")
         else "bare"
     )
     url = m.group(grp)
-    # Utiliser m.span(0) pour obtenir les positions incluant les délimiteurs
     s_idx, e_idx = m.span(0)
-    if grp == "bare" and url and url[-1] in _TAIL_PUNCT:
-        k = 0
-        while k < len(url) and url[-(k + 1)] in _TAIL_PUNCT:
-            k += 1
-        if k:
-            url = url[:-k]
-            e_idx -= k
+
+    if grp == "bare":
+        url, chars_stripped = _strip_url_tail(url)
+        e_idx -= chars_stripped
+
     return grp, s_idx, e_idx, url
 
 
-def _process_single_url_in_run(t_node: etree._Element, foot_root: etree._Element, next_id: int) -> int:
+# =======================
+# Validation HTTP des URLs
+# =======================
+_VALIDATION_TIMEOUT = 5  # secondes
+_VALIDATION_MAX_WORKERS = 8
+_VALIDATION_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _validate_url_http(url: str) -> bool:
+    """Vérifie qu'une URL répond avec un code 2xx ou 3xx (HEAD puis GET fallback)."""
+    headers = {"User-Agent": _VALIDATION_USER_AGENT}
+    try:
+        r = requests.head(
+            url, timeout=_VALIDATION_TIMEOUT, headers=headers,
+            allow_redirects=True, verify=True,
+        )
+        if r.status_code == 405:
+            r = requests.get(
+                url, timeout=_VALIDATION_TIMEOUT, headers=headers,
+                allow_redirects=True, verify=True, stream=True,
+            )
+            r.close()
+        return r.status_code < 400
+    except Exception:
+        return False
+
+
+def _validate_urls_parallel(urls: list) -> dict:
+    """Valide une liste d'URLs en parallèle. Retourne {url: bool}."""
+    if not urls:
+        return {}
+    unique_urls = list(set(urls))
+    print(f"[footnotes] Validation de {len(unique_urls)} URL(s) en parallèle...")
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(len(unique_urls), _VALIDATION_MAX_WORKERS)) as executor:
+        future_to_url = {
+            executor.submit(_validate_url_http, u): u
+            for u in unique_urls
+        }
+        for future in as_completed(future_to_url):
+            u = future_to_url[future]
+            try:
+                results[u] = future.result()
+            except Exception:
+                results[u] = False
+    valid_count = sum(1 for v in results.values() if v)
+    print(f"[footnotes] {valid_count}/{len(unique_urls)} URL(s) valide(s)")
+    return results
+
+
+def _collect_all_urls_from_doc(doc_root: etree._Element) -> list:
+    """Pré-scan en lecture seule : extrait toutes les URLs du document."""
+    urls = []
+    for t in doc_root.xpath("//w:body//w:p//w:r/w:t", namespaces=NS):
+        text = t.text or ""
+        while text:
+            found = _first_url_in_text(text)
+            if not found:
+                break
+            _, _, e_idx, url = found
+            urls.append(url)
+            text = text[e_idx:]
+    return urls
+
+
+# =======================
+# Correction des URLs invalides via recherche web
+# =======================
+def _extract_search_query_from_url(url: str) -> str:
+    """Construit une requête de recherche à partir des composants d'une URL invalide."""
+    parsed = urlparse(url)
+    domain = parsed.netloc or ""
+    path = parsed.path or ""
+
+    # Extraire les mots significatifs du chemin
+    path_words = re.split(r"[/\-_\.]+", path)
+    path_words = [w for w in path_words if len(w) > 2 and not w.isdigit()]
+
+    # Construire la requête : site:domain + mots du chemin
+    query_parts = []
+    if domain:
+        query_parts.append(f"site:{domain}")
+    query_parts.extend(path_words[:8])
+
+    return " ".join(query_parts)
+
+
+def _search_correct_url(invalid_url: str) -> str:
+    """Cherche le bon lien via Serper (recherche web classique).
+
+    Retourne l'URL corrigée, ou l'URL originale si aucun résultat trouvé.
+    """
+    if not _SERPER_API_KEY:
+        return invalid_url
+
+    query = _extract_search_query_from_url(invalid_url)
+    if not query or query.strip().startswith("site:") and len(query.split()) <= 1:
+        return invalid_url
+
+    headers = {"X-API-KEY": _SERPER_API_KEY, "Content-Type": "application/json"}
+    parsed_original = urlparse(invalid_url)
+    original_domain = parsed_original.netloc or ""
+
+    try:
+        r = requests.post(
+            "https://google.serper.dev/search",
+            headers=headers,
+            json={"q": query, "num": 5},
+            timeout=10,
+        )
+        r.raise_for_status()
+        organic = (r.json() or {}).get("organic", []) or []
+    except Exception as e:
+        print(f"[footnotes] Recherche Serper échouée pour {invalid_url}: {e}")
+        return invalid_url
+
+    if not organic:
+        # Fallback : recherche sans site: pour élargir
+        fallback_query = query.replace(f"site:{original_domain}", "").strip()
+        if fallback_query:
+            try:
+                r = requests.post(
+                    "https://google.serper.dev/search",
+                    headers=headers,
+                    json={"q": fallback_query, "num": 5},
+                    timeout=10,
+                )
+                r.raise_for_status()
+                organic = (r.json() or {}).get("organic", []) or []
+            except Exception:
+                return invalid_url
+
+    if not organic:
+        return invalid_url
+
+    # Privilégier un résultat du même domaine
+    for item in organic:
+        link = item.get("link", "")
+        if link and original_domain and original_domain in link:
+            print(f"[footnotes] URL corrigée (même domaine) : {invalid_url} → {link}")
+            return link
+
+    # Sinon prendre le premier résultat
+    first_link = organic[0].get("link", "")
+    if first_link:
+        print(f"[footnotes] URL corrigée (premier résultat) : {invalid_url} → {first_link}")
+        return first_link
+
+    return invalid_url
+
+
+def _fix_invalid_urls(validation_results: dict) -> dict:
+    """Pour chaque URL invalide, tente de trouver le bon lien via recherche web.
+
+    Retourne un dict {url_originale: url_corrigée} pour les URLs qui ont été corrigées.
+    """
+    invalid_urls = [url for url, is_valid in validation_results.items() if not is_valid]
+    if not invalid_urls:
+        return {}
+    if not _SERPER_API_KEY:
+        print("[footnotes] SERPER_API_KEY absente, impossible de corriger les URLs invalides.")
+        return {}
+
+    print(f"[footnotes] Recherche de liens corrects pour {len(invalid_urls)} URL(s) invalide(s)...")
+    corrections = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(invalid_urls), _VALIDATION_MAX_WORKERS)) as executor:
+        future_to_url = {
+            executor.submit(_search_correct_url, u): u
+            for u in invalid_urls
+        }
+        for future in as_completed(future_to_url):
+            original = future_to_url[future]
+            try:
+                corrected = future.result()
+                if corrected != original:
+                    corrections[original] = corrected
+            except Exception:
+                pass
+
+    print(f"[footnotes] {len(corrections)}/{len(invalid_urls)} URL(s) corrigée(s)")
+    return corrections
+
+
+def _process_single_url_in_run(
+    t_node: etree._Element,
+    foot_root: etree._Element,
+    next_id: int,
+    url_to_id: dict,
+    validation_results: dict,
+    url_corrections: dict,
+) -> int:
     text = t_node.text or ""
     found = _first_url_in_text(text)
     if not found:
@@ -536,14 +761,22 @@ def _process_single_url_in_run(t_node: etree._Element, foot_root: etree._Element
     grp, s_idx, e_idx, url = found
     parent_run = t_node.getparent()
 
-    # s_idx et e_idx incluent maintenant les délimiteurs (grâce à m.span(0))
-    # Donc on supprime tout: délimiteurs + URL
     left = text[:s_idx]
     right = text[e_idx:]
 
+    # Déduplication : si l'URL a déjà une note, on la retire du texte sans ajouter de référence
+    if url in url_to_id:
+        t_node.text = left + right
+        return next_id
+
+    # Première occurrence → créer la note
+    note_id = next_id
+    url_to_id[url] = note_id
+    next_id += 1
+
     t_node.text = left
 
-    run_ref = _make_footnote_reference_run(next_id)
+    run_ref = _make_footnote_reference_run(note_id)
 
     run_after = None
     if right:
@@ -556,9 +789,17 @@ def _process_single_url_in_run(t_node: etree._Element, foot_root: etree._Element
     seq = [run_ref] + ([run_after] if run_after is not None else [])
     _insert_sequence_at(parent_run, seq)
 
-    _append_footnote(foot_root, next_id, url)
+    # Déterminer le texte de la note
+    is_valid = validation_results.get(url, True)
+    if is_valid:
+        footnote_text = url
+    elif url in url_corrections:
+        footnote_text = url_corrections[url]
+    else:
+        footnote_text = f"[lien non vérifié] {url}"
+    _append_footnote(foot_root, note_id, footnote_text)
 
-    return next_id + 1
+    return next_id
 
 
 def insert_url_footnotes(docx_path: str, out_path: str = None) -> str:
@@ -586,6 +827,16 @@ def insert_url_footnotes(docx_path: str, out_path: str = None) -> str:
     ]
     next_id = max(existing_ids) + 1 if existing_ids else 1
 
+    # Pré-scan + validation parallèle des URLs
+    all_urls = _collect_all_urls_from_doc(doc_root)
+    validation_results = _validate_urls_parallel(all_urls)
+
+    # Correction des URLs invalides via recherche web
+    url_corrections = _fix_invalid_urls(validation_results)
+
+    # Map de déduplication : url → note_id
+    url_to_id: dict = {}
+
     for p in doc_root.xpath("//w:body//w:p", namespaces=NS):
         changed = True
         while changed:
@@ -595,7 +846,10 @@ def insert_url_footnotes(docx_path: str, out_path: str = None) -> str:
                 if not t.text:
                     continue
                 if _first_url_in_text(t.text):
-                    next_id = _process_single_url_in_run(t, foot_root, next_id)
+                    next_id = _process_single_url_in_run(
+                        t, foot_root, next_id,
+                        url_to_id, validation_results, url_corrections,
+                    )
                     changed = True
                     break
 

@@ -5,10 +5,23 @@ import re
 from typing import Any, Dict, Optional
 
 from docxtpl import DocxTemplate, InlineImage
+from docx import Document as DocxDocument
 from docx.shared import Cm
 
 from Core.writer_tpl import format_docx, clean_custom_tags
 from Core.footnotes import auto_annotate_docx_with_footnotes
+
+
+def _enable_update_fields(docx_path: str) -> None:
+    """
+    Active la mise à jour automatique des champs Word (PAGE, NUMPAGES, TOC, etc.)
+    à l'ouverture du document. Utilise python-docx pour une modification sûre.
+
+    Cela résout le problème des numéros de page figés (ex: "4/7").
+    """
+    doc = DocxDocument(docx_path)
+    doc.settings.update_fields = True
+    doc.save(docx_path)
 
 
 # Caractères interdits dans XML 1.0 (Word)
@@ -88,6 +101,9 @@ def generate_docx(
     # Render & save
     doc.render(context)
     doc.save(output_path)
+
+    # Forcer la mise à jour des champs Word (numéros de page, etc.)
+    _enable_update_fields(output_path)
 
     # Post-traitement (listes, markdown, tags rouge, footnotes)
     format_docx(output_path)

@@ -314,6 +314,12 @@ def _generate_docx_sync(
     if has_articles:
         steps_list.append({"key": "articles", "label": "Analyse des articles scientifiques"})
 
+    # Scraping des sites concurrents si CII avec URLs
+    if type_dossier == "CII" and req.competitors:
+        has_competitor_urls = any(c.site for c in req.competitors if c.site)
+        if has_competitor_urls:
+            steps_list.append({"key": "scraping_competitors", "label": "Analyse des sites web concurrents"})
+
     steps_list.extend([
         {"key": "sections", "label": "Génération du contenu scientifique"},
         {"key": "figures", "label": "Analyse et planification des figures"},
@@ -396,6 +402,7 @@ def _generate_docx_sync(
             visee_generale="",
             performance_type="",
             doc_complete=req.doc_complete,
+            emit=emit,
         )
         emit("figures", "Analyse et planification des figures", 55)
         sections, src_docx_figures, captions_text = prepare_figures_for_cii(

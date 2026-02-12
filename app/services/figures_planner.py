@@ -416,7 +416,7 @@ def prepare_figures_for_cir(
     sections_cir: Dict[str, str],
     max_figures: int = 10,
     min_side: int = 300,
-    max_images_candidates: int = 20,  # Limite à 10 images max pour éviter les timeouts
+    max_images_candidates: int = 20,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Spécifique CIR : on travaille sur les sections
@@ -441,7 +441,7 @@ def prepare_figures_for_cii(
     sections_cii: Dict[str, str],
     max_figures: int = 10,
     min_side: int = 300,
-    max_images_candidates: int = 20,  # Limite à 10 images max pour éviter les timeouts
+    max_images_candidates: int = 20,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
     Spécifique CII : on travaille sur les sections

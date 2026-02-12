@@ -47,3 +47,34 @@ def delete_user(email: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def assign_user_to_team(user_email: str, team_id: str) -> Optional[AppUser]:
+    """Assigne un utilisateur à une équipe."""
+    return update_user(user_email, {"team_id": team_id})
+
+
+def remove_user_from_team(user_email: str) -> Optional[AppUser]:
+    """Retire un utilisateur de son équipe."""
+    return update_user(user_email, {"team_id": None})
+
+
+def get_users_by_team(team_id: str) -> List[AppUser]:
+    """Récupère tous les utilisateurs d'une équipe."""
+    container = get_users_container()
+    items = container.query_items(
+        query="SELECT * FROM c WHERE c.team_id = @team_id",
+        parameters=[{"name": "@team_id", "value": team_id}],
+        enable_cross_partition_query=True,
+    )
+    return [AppUser(**it) for it in items]
+
+
+def get_users_without_team() -> List[AppUser]:
+    """Récupère tous les consultants sans équipe."""
+    container = get_users_container()
+    items = container.query_items(
+        query="SELECT * FROM c WHERE (NOT IS_DEFINED(c.team_id) OR c.team_id = null) AND c.role = 'consultant'",
+        enable_cross_partition_query=True,
+    )
+    return [AppUser(**it) for it in items]
