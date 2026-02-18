@@ -454,8 +454,7 @@ def prepare_figures_for_cii(
     - resultats
     """
     section_keys = [
-        "presentation",
-        "resume",
+        # "presentation" exclue : pas de figures dans la présentation globale de la société
         "contexte",
         "analyse",
         "performances",

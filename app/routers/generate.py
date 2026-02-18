@@ -1,8 +1,10 @@
 # app/routers/generate.py
 
 import asyncio
+import gc
 import json
 import tempfile
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -60,8 +62,9 @@ class _Job:
     events: List[dict] = field(default_factory=list)
     done: bool = False
     error: Optional[str] = None
-    result: Optional[dict] = None  # {"content": bytes, "filename": str, "project_id": str, "blob_url": str}
+    result: Optional[dict] = None  # {"filename": str, "project_id": str, "blob_url": str}
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
+    finished_at: Optional[float] = None  # timestamp quand le job est terminé
 
     async def emit(self, payload: dict) -> None:
         async with self.cond:
@@ -77,6 +80,23 @@ class _Job:
 
 # Cache mémoire pour les jobs en cours (nécessaire pour SSE)
 _JOBS: Dict[str, _Job] = {}
+
+# Durée de rétention des jobs terminés en mémoire (30 minutes)
+_JOB_TTL_SECONDS = 30 * 60
+
+
+def _cleanup_old_jobs() -> None:
+    """Supprime les jobs terminés depuis plus de _JOB_TTL_SECONDS."""
+    now = time.time()
+    expired = [
+        jid for jid, j in _JOBS.items()
+        if j.done and j.finished_at and (now - j.finished_at) > _JOB_TTL_SECONDS
+    ]
+    for jid in expired:
+        del _JOBS[jid]
+    if expired:
+        gc.collect()
+        print(f"[CLEANUP] {len(expired)} old job(s) removed from memory")
 
 
 def _log_progress(step: str, label: str, percent: int) -> None:
@@ -492,6 +512,9 @@ async def start_generate_job(
     req: GenerateRequest = GenerateRequest.model_validate_json(payload)
     user_email = current_user.email
 
+    # Nettoyer les vieux jobs pour libérer de la mémoire
+    _cleanup_old_jobs()
+
     loop = asyncio.get_running_loop()
     job_id = str(uuid4())
 
@@ -560,14 +583,18 @@ async def start_generate_job(
             # Mettre à jour le job dans Cosmos avec le résultat
             _complete_job_in_cosmos(job_id, project_id, filename, blob_url)
 
-            job.result = {"filename": filename, "content": content, "project_id": project_id, "blob_url": blob_url}
+            # NE PAS garder content (bytes) en mémoire — le fichier est déjà sur Azure Blob
+            job.result = {"filename": filename, "project_id": project_id, "blob_url": blob_url}
+            del content  # Libérer la mémoire immédiatement
             job.done = True
+            job.finished_at = time.time()
             await job.emit({"type": "done", "step": "done", "label": "Dossier prêt", "percent": 100})
 
         except Exception as e:
             error_msg = str(e)
             job.error = error_msg
             job.done = True
+            job.finished_at = time.time()
 
             # Persister l'erreur dans Cosmos
             _fail_job_in_cosmos(job_id, project_id, error_msg)
@@ -702,8 +729,10 @@ async def get_job_status(
 
 @router.get("/jobs/{job_id}/download", summary="Télécharge le DOCX final du job")
 async def download_generate_job(job_id: str, current_user: AppUser = Depends(get_current_user)):
-    # D'abord chercher en mémoire (le plus rapide)
+    # Chercher le job (mémoire ou Cosmos)
     job = _JOBS.get(job_id)
+    blob_url: Optional[str] = None
+    filename: Optional[str] = None
 
     if job:
         if job.user_email != current_user.email:
@@ -714,41 +743,27 @@ async def download_generate_job(job_id: str, current_user: AppUser = Depends(get
             raise HTTPException(status_code=400, detail=job.error)
         if not job.result:
             raise HTTPException(status_code=500, detail="Résultat manquant")
-
-        content: bytes = job.result["content"]
-        filename: str = job.result["filename"]
-
-        # Ne plus supprimer le job de la mémoire immédiatement
-        # On le garde pour permettre des re-téléchargements
-        # Le nettoyage se fera via un TTL ou garbage collection
-
-        return Response(
-            content,
-            media_type=DOCX_MIME,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-
-    # Si pas en mémoire, chercher dans Cosmos DB
-    cosmos_job = _find_job_by_id(job_id)
-    if not cosmos_job:
-        raise HTTPException(status_code=404, detail="Job introuvable")
-
-    if cosmos_job.get("user_email") != current_user.email:
-        raise HTTPException(status_code=403, detail="Accès interdit")
-
-    status = cosmos_job.get("status")
-    if status == JobStatus.ERROR:
-        raise HTTPException(status_code=400, detail=cosmos_job.get("error_message", "Erreur"))
-    if status != JobStatus.DONE:
-        raise HTTPException(status_code=202, detail="Pas prêt")
-
-    blob_url = cosmos_job.get("blob_url")
-    filename = cosmos_job.get("filename")
+        blob_url = job.result.get("blob_url")
+        filename = job.result.get("filename")
+    else:
+        # Chercher dans Cosmos DB
+        cosmos_job = _find_job_by_id(job_id)
+        if not cosmos_job:
+            raise HTTPException(status_code=404, detail="Job introuvable")
+        if cosmos_job.get("user_email") != current_user.email:
+            raise HTTPException(status_code=403, detail="Accès interdit")
+        status = cosmos_job.get("status")
+        if status == JobStatus.ERROR:
+            raise HTTPException(status_code=400, detail=cosmos_job.get("error_message", "Erreur"))
+        if status != JobStatus.DONE:
+            raise HTTPException(status_code=202, detail="Pas prêt")
+        blob_url = cosmos_job.get("blob_url")
+        filename = cosmos_job.get("filename")
 
     if not blob_url or not filename:
-        raise HTTPException(status_code=500, detail="Résultat manquant dans Cosmos")
+        raise HTTPException(status_code=500, detail="Résultat manquant")
 
-    # Télécharger le contenu depuis le blob
+    # Toujours télécharger depuis Azure Blob (pas de bytes en mémoire)
     content = _download_blob_content(blob_url)
     if not content:
         raise HTTPException(status_code=500, detail="Impossible de récupérer le fichier")

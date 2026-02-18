@@ -10,20 +10,31 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 
+def normalize_url(url: str) -> str:
+    """Ajoute https:// si le protocole est absent."""
+    url = url.strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
 def scrape_website(url: str, max_pages: int = 3, timeout: int = 10) -> str:
     """
     Scrape le site web et retourne le texte principal.
 
     Args:
-        url: URL du site (ex: https://entreprise.com)
+        url: URL du site (ex: https://entreprise.com ou www.entreprise.com)
         max_pages: Nombre max de pages à scraper (pour l'instant 1 seule)
         timeout: Timeout en secondes pour chaque requête
 
     Returns:
         Texte extrait (title + description + contenu principal)
     """
-    if not url or not url.startswith("http"):
-        print(f"[Web Scraper] URL invalide : {url}")
+    url = normalize_url(url)
+    if not url:
+        print(f"[Web Scraper] URL vide")
         return ""
 
     try:
@@ -168,6 +179,7 @@ def extract_website_context(site_web: str, text_admin: str, min_words: int = 500
         return text_admin
 
     # Scraping nécessaire
+    site_web = normalize_url(site_web)
     print(f"[Web Scraper] Docs admin insuffisants ({word_count} mots), scraping de {site_web}...")
 
     scraped_text = scrape_website(site_web)
@@ -193,7 +205,7 @@ def validate_url(url: str) -> bool:
     Valide qu'une URL est bien formée et accessible.
 
     Args:
-        url: URL à valider
+        url: URL à valider (avec ou sans protocole)
 
     Returns:
         True si l'URL semble valide, False sinon
@@ -202,7 +214,7 @@ def validate_url(url: str) -> bool:
         return False
 
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(normalize_url(url))
         return all([parsed.scheme in ["http", "https"], parsed.netloc])
     except Exception:
         return False

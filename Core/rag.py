@@ -30,6 +30,7 @@ if USE_RESPONSES_API:
         api_key=os.getenv("AZURE_OPENAI_KEY"),
         base_url=base_url,
         timeout=LLM_TIMEOUT,
+        max_retries=3,  # Retry auto sur erreurs 429 (rate limit) et 5xx
     )
 
     print(f"[DEBUG] Client type: {type(client)}, has responses: {hasattr(client, 'responses')}, timeout: {LLM_TIMEOUT}s")
@@ -40,6 +41,7 @@ else:
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_version=API_VERSION,
         timeout=LLM_TIMEOUT,
+        max_retries=3,  # Retry auto sur erreurs 429 (rate limit) et 5xx
     )
 
 GPT_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")

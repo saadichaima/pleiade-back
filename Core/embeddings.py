@@ -10,7 +10,8 @@ EMBEDDING_API_VERSION = os.getenv("AZURE_OPENAI_EMBEDDING_API_VERSION") or os.ge
 client = AzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_EMBEDDING_KEY") or os.getenv("AZURE_OPENAI_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_EMBEDDING_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_version=EMBEDDING_API_VERSION
+    api_version=EMBEDDING_API_VERSION,
+    max_retries=3,  # Retry auto sur erreurs 429 (rate limit)
 )
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
