@@ -8,6 +8,8 @@ Service de recherche dans les dossiers CIR existants.
 
 import os
 import re
+import hashlib
+import pickle
 import unicodedata
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -21,15 +23,28 @@ import fitz  # PyMuPDF
 # Pour la lecture de Word
 from docx import Document as DocxDocument
 
-# Pour les embeddings et la recherche sémantique
+# Pour le TF-IDF (fallback)
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+
+# Pour les embeddings Azure OpenAI (semantic search)
+from Core.embeddings import embed_texts, embed_texts_batch
 
 
 # Configuration
 CIR_BASE_PATH = Path(os.getenv("CIR_FOLDER_PATH", r"C:\Projet bconseil\pleiadeFrontBack\Dossier CIR"))
 EXCEL_FILENAME = "JOINTURE BECOME.xlsx"
+EMBEDDINGS_CACHE_DIR = CIR_BASE_PATH / ".embeddings_cache"
+
+# Patterns pour détecter les sections "état de l'art" dans les dossiers CIR
+ETAT_ART_PATTERNS = [
+    r"objet\s+de\s+l[''\u2019]?op[ée]ration\s+de\s+r\s*[&e]\s*d",
+    r"description\s+du\s+verrou\s+scientifique",
+    r"verrou\s+scientifique\s+ou\s+technique",
+    r"[ée]tat\s+de\s+l[''\u2019]?art",
+    r"analyse\s+bibliographique",
+]
 
 
 @dataclass
@@ -200,9 +215,15 @@ class DocumentIndexer:
     def __init__(self, base_path: Path):
         self.base_path = base_path
         self.documents: List[Dict] = []
-        self.chunks: List[DocumentChunk] = []
+        self.chunks: List[DocumentChunk] = []  # uniquement chunks état de l'art
+        # TF-IDF (fallback)
         self.vectorizer: Optional[TfidfVectorizer] = None
         self.tfidf_matrix = None
+        # Descriptions par document (texte court pour embedding)
+        self.doc_descriptions: List[Dict] = []
+        # Embeddings sur les descriptions (pas sur les chunks)
+        self.embedding_vectors: Optional[np.ndarray] = None
+        self.embeddings_available: bool = False
         self._index_documents()
 
     def _extract_client_from_filename(self, filename: str) -> str:
@@ -311,41 +332,162 @@ class DocumentIndexer:
         # Limiter le nombre d'articles extraits
         return articles[:20]
 
+    def _is_etat_art_content(self, chunk: DocumentChunk) -> bool:
+        """Vérifie si un chunk appartient à une section état de l'art / verrou / objet R&D."""
+        section_lower = (chunk.page_or_section or "").lower()
+        text_start = chunk.text[:500].lower()
+
+        for pattern in ETAT_ART_PATTERNS:
+            # Pour DOCX : le titre de section est dans page_or_section
+            if re.search(pattern, section_lower):
+                return True
+            # Pour PDF : le titre peut apparaître dans le texte de la page
+            if re.search(pattern, text_start):
+                return True
+
+        return False
+
+    def _build_and_embed_descriptions(self):
+        """Crée des descriptions courtes par document et les embed."""
+        import json
+
+        # Grouper les chunks état de l'art par document
+        doc_groups: Dict[str, Dict] = {}
+        for i, chunk in enumerate(self.chunks):
+            key = chunk.document_path
+            if key not in doc_groups:
+                doc_groups[key] = {
+                    'path': chunk.document_path,
+                    'name': chunk.document_name,
+                    'client': chunk.client_name,
+                    'team': chunk.team,
+                    'chunk_indices': [],
+                    'text_parts': []
+                }
+            doc_groups[key]['chunk_indices'].append(i)
+            doc_groups[key]['text_parts'].append(chunk.text)
+
+        # Créer une description courte par document (texte tronqué)
+        self.doc_descriptions = []
+        for doc in doc_groups.values():
+            combined = '\n'.join(doc['text_parts'])
+            description = combined[:800]  # ~200 tokens, suffisant pour la recherche
+            self.doc_descriptions.append({
+                'path': doc['path'],
+                'client': doc['client'],
+                'team': doc['team'],
+                'chunk_indices': doc['chunk_indices'],
+                'description': description
+            })
+
+        # Sauvegarder les descriptions en JSON (inspectable)
+        try:
+            EMBEDDINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            json_cache = EMBEDDINGS_CACHE_DIR / "descriptions_cache.json"
+            json_data = [
+                {'client': d['client'], 'team': d['team'], 'description': d['description'][:200]}
+                for d in self.doc_descriptions
+            ]
+            with open(json_cache, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, ensure_ascii=False, indent=2)
+            print(f"[CIR] {len(json_data)} descriptions sauvegardées dans {json_cache}")
+        except Exception as e:
+            print(f"[CIR] Erreur sauvegarde descriptions JSON: {e}")
+
+        # Embed les descriptions (petits batches pour respecter S0 rate limit)
+        desc_texts = [d['description'] for d in self.doc_descriptions]
+        nb_docs = len(desc_texts)
+        desc_hash = self._compute_chunks_hash(desc_texts)
+
+        cached_vectors = self._load_embedding_cache(desc_hash, nb_docs)
+        if cached_vectors is not None:
+            self.embedding_vectors = cached_vectors
+            self.embeddings_available = True
+        else:
+            print(f"[CIR] Embedding de {nb_docs} descriptions (~800 chars chacune)...")
+            vectors = embed_texts_batch(desc_texts, batch_size=20, delay_between=2)
+            if vectors:
+                self.embedding_vectors = np.array(vectors, dtype=np.float32)
+                self.embeddings_available = True
+                self._save_embedding_cache(self.embedding_vectors, desc_hash, nb_docs)
+            else:
+                print("[CIR] Embeddings indisponibles, fallback sur TF-IDF")
+                self.embeddings_available = False
+
+    def _compute_chunks_hash(self, texts: List[str]) -> str:
+        """Calcule un hash SHA256 des textes pour détecter les changements."""
+        h = hashlib.sha256()
+        for t in texts:
+            h.update(t.encode('utf-8', errors='ignore'))
+        return h.hexdigest()
+
+    def _load_embedding_cache(self, chunks_hash: str, expected_count: int) -> Optional[np.ndarray]:
+        """Charge les embeddings depuis le cache disque si le hash correspond."""
+        cache_path = EMBEDDINGS_CACHE_DIR / "cache.pkl"
+        if not cache_path.exists():
+            return None
+        try:
+            with open(cache_path, 'rb') as f:
+                cache = pickle.load(f)
+            if cache.get("chunks_hash") == chunks_hash and cache.get("doc_count") == expected_count:
+                print(f"[CIR] Cache embeddings valide, chargement de {cache['doc_count']} vecteurs")
+                return cache["vectors"]
+            else:
+                print("[CIR] Cache embeddings invalide (documents modifiés), recalcul nécessaire")
+                return None
+        except Exception as e:
+            print(f"[CIR] Erreur lecture cache: {e}")
+            return None
+
+    def _save_embedding_cache(self, vectors: np.ndarray, chunks_hash: str, doc_count: int):
+        """Sauvegarde les embeddings en cache disque."""
+        try:
+            EMBEDDINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_path = EMBEDDINGS_CACHE_DIR / "cache.pkl"
+            cache = {
+                "chunks_hash": chunks_hash,
+                "vectors": vectors,
+                "doc_count": doc_count
+            }
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache, f)
+            print(f"[CIR] Embeddings sauvegardés en cache ({doc_count} vecteurs)")
+        except Exception as e:
+            print(f"[CIR] Erreur sauvegarde cache: {e}")
+
     def _index_documents(self):
-        """Indexe tous les documents PDF et Word dans les dossiers d'équipes."""
+        """Indexe les documents CIR en filtrant uniquement les sections état de l'art."""
         if not self.base_path.exists():
             print(f"[WARN] CIR base path not found: {self.base_path}")
             return
 
-        # Parcourir les dossiers d'équipes
+        # Phase 1 : Lire tous les documents
+        all_chunks: List[DocumentChunk] = []
+
         for team_dir in self.base_path.iterdir():
             if not team_dir.is_dir() or not team_dir.name.startswith("Equipe"):
                 continue
 
             team_name = team_dir.name
 
-            # Parcourir les fichiers
             for file_path in team_dir.iterdir():
                 if file_path.suffix.lower() in ['.pdf', '.docx', '.doc']:
                     client_name = self._extract_client_from_filename(file_path.name)
 
-                    # Lire le document
                     if file_path.suffix.lower() == '.pdf':
                         raw_chunks = self._read_pdf(file_path)
                     else:
                         raw_chunks = self._read_docx(file_path)
 
-                    # Créer les chunks
                     for text, location in raw_chunks:
-                        chunk = DocumentChunk(
+                        all_chunks.append(DocumentChunk(
                             text=text,
                             document_path=str(file_path),
                             document_name=file_path.name,
                             page_or_section=location,
                             team=team_name,
                             client_name=client_name
-                        )
-                        self.chunks.append(chunk)
+                        ))
 
                     self.documents.append({
                         'path': str(file_path),
@@ -354,35 +496,83 @@ class DocumentIndexer:
                         'client': client_name
                     })
 
-        # Construire l'index TF-IDF
-        if self.chunks:
-            self.vectorizer = TfidfVectorizer(
-                max_features=10000,
-                ngram_range=(1, 2),
-                stop_words=None  # On garde les stop words français pour le moment
-            )
-            texts = [chunk.text for chunk in self.chunks]
-            self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+        # Phase 2 : Filtrer — garder uniquement les sections état de l'art
+        etat_art_chunks = [c for c in all_chunks if self._is_etat_art_content(c)]
 
-        print(f"[INFO] Indexed {len(self.documents)} documents with {len(self.chunks)} chunks")
+        if etat_art_chunks:
+            self.chunks = etat_art_chunks
+            print(f"[CIR] {len(self.chunks)} chunks état de l'art trouvés (sur {len(all_chunks)} total)")
+        else:
+            self.chunks = all_chunks
+            print(f"[CIR] Aucun chunk état de l'art détecté, utilisation de tous les {len(all_chunks)} chunks")
+
+        if not self.chunks:
+            print("[WARN] No chunks found")
+            return
+
+        # Phase 3 : TF-IDF sur les chunks filtrés (fallback)
+        texts = [chunk.text for chunk in self.chunks]
+        self.vectorizer = TfidfVectorizer(
+            max_features=10000,
+            ngram_range=(1, 2),
+            stop_words=None
+        )
+        self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+
+        # Phase 4 : Descriptions courtes par document + embeddings
+        self._build_and_embed_descriptions()
+
+        mode = "semantic (descriptions)" if self.embeddings_available else "TF-IDF (fallback)"
+        print(f"[INFO] Indexed {len(self.documents)} documents, {len(self.chunks)} chunks état de l'art, {len(self.doc_descriptions)} descriptions — mode: {mode}")
 
     def search(self, query: str, top_k: int = 10) -> List[Tuple[DocumentChunk, float]]:
-        """Recherche sémantique dans les documents."""
+        """Recherche principale : semantic si dispo, sinon TF-IDF."""
+        if self.embeddings_available:
+            return self.search_semantic(query, top_k)
+        return self.search_tfidf(query, top_k)
+
+    def search_semantic(self, query: str, top_k: int = 10) -> List[Tuple[DocumentChunk, float]]:
+        """Recherche sémantique via embeddings sur les descriptions de documents."""
+        if self.embedding_vectors is None or not self.doc_descriptions:
+            return self.search_tfidf(query, top_k)
+
+        # Embed la requête
+        query_vecs = embed_texts([query])
+        if not query_vecs:
+            print("[CIR] Échec embedding requête, fallback TF-IDF")
+            return self.search_tfidf(query, top_k)
+
+        query_vec = query_vecs[0].reshape(1, -1)
+
+        # Cosine similarity sur les descriptions
+        similarities = cosine_similarity(query_vec, self.embedding_vectors).flatten()
+        top_doc_indices = similarities.argsort()[::-1]
+
+        # Retourner les chunks état de l'art des documents matchés
+        results = []
+        for doc_idx in top_doc_indices:
+            doc_score = float(similarities[doc_idx])
+            if doc_score < 0.3:
+                break
+            for chunk_idx in self.doc_descriptions[doc_idx]['chunk_indices']:
+                results.append((self.chunks[chunk_idx], doc_score))
+            if len(results) >= top_k:
+                break
+
+        return results[:top_k]
+
+    def search_tfidf(self, query: str, top_k: int = 10) -> List[Tuple[DocumentChunk, float]]:
+        """Recherche TF-IDF (fallback)."""
         if not self.vectorizer or self.tfidf_matrix is None:
             return []
 
-        # Vectoriser la requête
         query_vec = self.vectorizer.transform([query])
-
-        # Calculer les similarités
         similarities = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-
-        # Trier par similarité
         top_indices = similarities.argsort()[-top_k:][::-1]
 
         results = []
         for idx in top_indices:
-            if similarities[idx] > 0.05:  # Seuil minimal
+            if similarities[idx] > 0.05:
                 results.append((self.chunks[idx], float(similarities[idx])))
 
         return results
