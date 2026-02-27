@@ -4,47 +4,18 @@ from typing import Optional, Dict, Any, List, Callable
 import re
 
 from dotenv import load_dotenv
-from openai import AzureOpenAI, OpenAI
 
 from Core.embeddings import embed_texts
+from Core.model_fallback import build_gpt_configs, GptModelConfig
 from app.services.prompts import fetch_cir, fetch_cii, prompt_evaluateur_travaux
 
 load_dotenv()
 
-# Détection du type d'API : Responses API (GPT-5.2+) ou Chat Completions API (GPT-4.1)
-API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "")
-USE_RESPONSES_API = API_VERSION.startswith("2025-") or "2025" in API_VERSION
-
 # Timeout pour les appels LLM (en secondes)
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))  # 2 minutes par defaut
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))
 
-if USE_RESPONSES_API:
-    # Nouvelle API Responses pour GPT-5.2
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-    # Garder cognitiveservices.azure.com pour Azure
-    base_url = endpoint.rstrip("/") + "/openai/v1/"
-
-    print(f"[DEBUG] Using Responses API with base_url: {base_url}")
-
-    client = OpenAI(
-        api_key=os.getenv("AZURE_OPENAI_KEY"),
-        base_url=base_url,
-        timeout=LLM_TIMEOUT,
-        max_retries=3,  # Retry auto sur erreurs 429 (rate limit) et 5xx
-    )
-
-    print(f"[DEBUG] Client type: {type(client)}, has responses: {hasattr(client, 'responses')}, timeout: {LLM_TIMEOUT}s")
-else:
-    # Ancienne API Chat Completions pour GPT-4.1
-    client = AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_KEY"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_version=API_VERSION,
-        timeout=LLM_TIMEOUT,
-        max_retries=3,  # Retry auto sur erreurs 429 (rate limit) et 5xx
-    )
-
-GPT_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+# Liste ordonnée des configs GPT : [primaire, fallback_1, fallback_2, ...]
+GPT_CONFIGS: List[GptModelConfig] = build_gpt_configs(LLM_TIMEOUT)
 
 TOKENS_SINK: Optional[Callable[[Dict[str, Any]], None]] = None
 def set_tokens_sink(fn: Callable[[Dict[str, Any]], None]):
@@ -59,71 +30,78 @@ def _extract_usage(resp):
     except Exception:
         return {}
 
+_SYSTEM_PROMPT = (
+    "Tu es un expert en rédaction scientifique et technique. Tu rédiges des sections détaillées, "
+    "développées et approfondies pour des dossiers de recherche (CIR/CII). Tes réponses doivent être "
+    "complètes et exhaustives. Respecte précisément les consignes de longueur et de format données dans le prompt."
+)
+
+
+def _call_ai_with_config(cfg: GptModelConfig, prompt: str, temperature: float, max_tokens: int):
+    """Exécute un appel LLM sur une configuration donnée. Retourne (txt, usage_dict)."""
+    if cfg.use_responses_api:
+        r = cfg.client.responses.create(
+            model=cfg.deployment,
+            input=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            max_output_tokens=max_tokens,
+        )
+        txt = r.output_text or ""
+        usage = {
+            "prompt_tokens": getattr(r.usage, "input_tokens", 0) if hasattr(r, "usage") else 0,
+            "completion_tokens": getattr(r.usage, "output_tokens", 0) if hasattr(r, "usage") else 0,
+            "total_tokens": getattr(r.usage, "total_tokens", 0) if hasattr(r, "usage") else 0,
+        }
+    else:
+        r = cfg.client.chat.completions.create(
+            model=cfg.deployment,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            max_completion_tokens=max_tokens,
+        )
+        txt = r.choices[0].message.content or ""
+        u = _extract_usage(r)
+        usage = {k: int(u.get(k, 0)) for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
+    return txt, usage
+
+
 def call_ai(prompt: str, *, meta: Optional[str] = None, temperature: float = 0.2, max_tokens: int = 40000) -> str:
     import time
     start_time = time.time()
-    prompt_len = len(prompt)
-    print(f"[CALL_AI] Debut appel LLM - meta={meta}, prompt={prompt_len} chars, max_tokens={max_tokens}")
+    print(f"[CALL_AI] Debut appel LLM - meta={meta}, prompt={len(prompt)} chars, max_tokens={max_tokens}")
 
-    try:
-        if USE_RESPONSES_API:
-            # Nouvelle API Responses pour GPT-5.2
-            # Note: GPT-5.2 ne supporte pas le paramètre temperature
-            r = client.responses.create(
-                model=GPT_DEPLOYMENT,
-                input=[
-                    {"role": "system", "content": "Tu es un expert rédaction scientifique."},
-                    {"role": "user", "content": prompt},
-                ],
-                max_output_tokens=max_tokens,
-            )
-            txt = r.output_text or ""
+    if not GPT_CONFIGS:
+        raise RuntimeError("Aucun modèle GPT configuré (vérifiez AZURE_OPENAI_KEY/ENDPOINT/DEPLOYMENT dans .env)")
 
-            # Extraction des tokens pour TOKENS_SINK
+    last_exc: Optional[Exception] = None
+    for i, cfg in enumerate(GPT_CONFIGS):
+        try:
+            txt, usage = _call_ai_with_config(cfg, prompt, temperature, max_tokens)
+            elapsed = time.time() - start_time
+            if i > 0:
+                print(f"[CALL_AI] Succès via modèle backup '{cfg.name}' - meta={meta}, reponse={len(txt)} chars, duree={elapsed:.1f}s")
+            else:
+                print(f"[CALL_AI] Succes - meta={meta}, reponse={len(txt)} chars, duree={elapsed:.1f}s")
             if TOKENS_SINK:
                 try:
-                    usage_data = {
-                        "meta": meta,
-                        "prompt_tokens": getattr(r.usage, "input_tokens", 0) if hasattr(r, "usage") else 0,
-                        "completion_tokens": getattr(r.usage, "output_tokens", 0) if hasattr(r, "usage") else 0,
-                        "total_tokens": getattr(r.usage, "total_tokens", 0) if hasattr(r, "usage") else 0,
-                    }
-                    TOKENS_SINK(usage_data)
+                    TOKENS_SINK({"meta": meta, **usage})
                 except Exception:
                     pass
-        else:
-            # Ancienne API Chat Completions pour GPT-4.1
-            r = client.chat.completions.create(
-                model=GPT_DEPLOYMENT,
-                messages=[
-                    {"role": "system", "content": "Tu es un expert rédaction scientifique."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=temperature,
-                max_completion_tokens=max_tokens,
-            )
-            txt = r.choices[0].message.content or ""
+            return txt
+        except Exception as e:
+            elapsed = time.time() - start_time
+            last_exc = e
+            if i < len(GPT_CONFIGS) - 1:
+                print(f"[CALL_AI] Modèle '{cfg.name}' échoué après {elapsed:.1f}s ({type(e).__name__}: {e}), tentative sur fallback...")
+            else:
+                print(f"[CALL_AI] Tous les modèles ont échoué - meta={meta}, duree={elapsed:.1f}s, derniere erreur={type(e).__name__}: {e}")
 
-            if TOKENS_SINK:
-                u = _extract_usage(r)
-                try:
-                    TOKENS_SINK(
-                        {
-                            "meta": meta,
-                            **{k: int(u.get(k, 0)) for k in ("prompt_tokens", "completion_tokens", "total_tokens")},
-                        }
-                    )
-                except Exception:
-                    pass
-
-        elapsed = time.time() - start_time
-        print(f"[CALL_AI] Succes - meta={meta}, reponse={len(txt)} chars, duree={elapsed:.1f}s")
-        return txt
-
-    except Exception as e:
-        elapsed = time.time() - start_time
-        print(f"[CALL_AI] ERREUR - meta={meta}, duree={elapsed:.1f}s, erreur={type(e).__name__}: {e}")
-        raise
+    raise last_exc
 
 # -------------------- RAG helpers --------------------
 def search_similar_chunks(query: str, index, chunks: List[str], vectors, top_k: int = 3):
@@ -183,15 +161,21 @@ def _tmpl(name: str) -> str:
         "footnotes": "footnotes.txt",
     }
     filename = mapping.get(name, f"{name}.txt")
-    return fetch_cir(filename)
+    content = fetch_cir(filename)
+    print(f"[PROMPT CIR] {name} ({filename}) -> {len(content)} chars | debut: {content[:150]}...")
+    return content
 
-def generate_section_with_rag(title: str, instruction: str, index, chunks, vectors, *, top_k: int = 3, temperature: float = 0.2) -> str:
+def generate_section_with_rag(title: str, instruction: str, index, chunks, vectors, *, top_k: int = 5, temperature: float = 0.2) -> str:
     ctx = "\n".join(search_similar_chunks(title or "section", index, chunks, vectors, top_k=top_k)) if index else ""
-    prompt = f"""Rédige la section "{title}".
-Contexte:
+    prompt = f"""Rédige la section "{title}" de manière détaillée et approfondie.
+
+Contexte documentaire :
 \"\"\"{ctx}\"\"\"
-Consignes:
+
+Consignes spécifiques (à suivre impérativement) :
 {instruction}
+
+IMPORTANT : Développe chaque point en profondeur. Fournis des explications techniques précises, des exemples concrets issus du contexte, et des analyses détaillées. Ne résume pas, développe.
 """
     return call_ai(prompt, meta=title, temperature=temperature)
 
@@ -722,16 +706,18 @@ QUESTION_RE = re.compile(r"(?is)\b(?:Pouvez|Pourriez)[\-\u2011\u2013 ]vous[^?]*\
 def wrap_questions_rouge(texte: str) -> str:
     if not texte:
         return texte
-    if "[[ROUGE:" in texte:
-        return texte
 
     pieces = []
     pos = 0
     for m in QUESTION_RE.finditer(texte):
         start, end = m.span()
+        q = m.group(0)
+        # Ne pas re-wrapper si la question est déjà dans un tag [[ROUGE: ... ]]
+        before = texte[:start]
+        if before.rfind("[[ROUGE:") > before.rfind("]]"):
+            continue
         if start > pos:
             pieces.append(texte[pos:start])
-        q = m.group(0)
         pieces.append(f"[[ROUGE: {q} ]]")
         pos = end
 

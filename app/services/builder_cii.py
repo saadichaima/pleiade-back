@@ -180,9 +180,9 @@ def build_sections_cii(
     )
 
     if not doc_complete:
+        print("[CII-BUILD] Evaluation demarche (doc incomplete)...")
         demarche = rag_cii.evaluateur_travaux(demarche)
         demarche = rag.wrap_questions_rouge(demarche)
-
 
     resultats = rag_cii.gen_resultats_annee(
         im, cm, vm,

@@ -328,6 +328,51 @@ def _call_azure_vision(
     return "\n".join(out_lines).strip()
 
 
+def _call_azure_vision_with_fallback(
+    parts: List[dict],
+    *,
+    primary_deployment: str,
+    max_output_tokens: int = 500,
+    temperature: float = 0.0,
+) -> str:
+    """
+    Appelle Azure Vision avec fallback automatique sur les modèles backup.
+    Utilise GPT_CONFIGS définis dans Core.rag (primaire + fallbacks).
+    """
+    # Import lazy pour éviter les imports circulaires
+    from Core.rag import GPT_CONFIGS
+
+    if not GPT_CONFIGS:
+        # Aucune config GPT disponible, utiliser l'ancienne méthode directe
+        client = _get_azure_client()
+        return _call_azure_vision(
+            client, model=primary_deployment, parts=parts,
+            max_output_tokens=max_output_tokens, temperature=temperature,
+        )
+
+    last_exc = None
+    for i, cfg in enumerate(GPT_CONFIGS):
+        # Primaire : utiliser le deployment vision explicite (peut différer du GPT deployment)
+        # Fallbacks : utiliser le deployment du modèle backup
+        model_name = primary_deployment if i == 0 else cfg.deployment
+        try:
+            result = _call_azure_vision(
+                cfg.client, model=model_name, parts=parts,
+                max_output_tokens=max_output_tokens, temperature=temperature,
+            )
+            if i > 0:
+                print(f"[description_img] Succès via modèle backup '{cfg.name}'")
+            return result
+        except Exception as e:
+            last_exc = e
+            if i < len(GPT_CONFIGS) - 1:
+                print(f"[description_img] Modèle '{cfg.name}' échoué ({type(e).__name__}), tentative fallback...")
+            else:
+                print(f"[description_img] Tous les modèles ont échoué: {type(e).__name__}: {e}")
+
+    raise last_exc
+
+
 def _prepare_parts_from_payloads(
     payloads: List[Dict[str, object]],
     *,
@@ -411,7 +456,6 @@ def summarise_with_azure(
         prompt_overhead_tokens=prompt_overhead_tokens,
     )
 
-    client = _get_azure_client()
     deployment = model or os.environ.get(
         "AZURE_OPENAI_VISION_DEPLOYMENT", "gpt-4.1"
     )
@@ -424,10 +468,9 @@ def summarise_with_azure(
             consigne=consigne,
             start_index=start_idx,
         )
-        text = _call_azure_vision(
-            client,
-            model=deployment,
-            parts=parts,
+        text = _call_azure_vision_with_fallback(
+            parts,
+            primary_deployment=deployment,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
         )

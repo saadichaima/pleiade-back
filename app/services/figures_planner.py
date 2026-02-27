@@ -393,8 +393,8 @@ def _prepare_figures_for_dossier(
         legends.append(legend)
 
     if not ordered_images:
-        print("[figures_planner] Aucune image retenue après mapping IA.")
-        return new_sections, None, None
+        print("[figures_planner] Aucune image retenue après mapping IA → sections originales conservées (sans références figures).")
+        return sections, None, None
 
     # 12) captions_text utilisable par insert_images_by_reference_live
     lines = []
@@ -419,12 +419,9 @@ def prepare_figures_for_cir(
     max_images_candidates: int = 20,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
-    Spécifique CIR : on travaille sur les sections
-    - contexte
-    - travaux
-    - contribution
+    Spécifique CIR : figures uniquement dans travaux et contribution (résultats).
     """
-    section_keys = ["contexte", "travaux", "contribution"]
+    section_keys = ["travaux", "contribution"]
     return _prepare_figures_for_dossier(
         "CIR",
         docs_client_data,
@@ -444,20 +441,9 @@ def prepare_figures_for_cii(
     max_images_candidates: int = 20,
 ) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
     """
-    Spécifique CII : on travaille sur les sections
-    - presentation
-    - resume
-    - contexte
-    - analyse
-    - performances
-    - demarche
-    - resultats
+    Spécifique CII : figures uniquement dans démarche (travaux) et résultats.
     """
     section_keys = [
-        # "presentation" exclue : pas de figures dans la présentation globale de la société
-        "contexte",
-        "analyse",
-        "performances",
         "demarche",
         "resultats",
     ]

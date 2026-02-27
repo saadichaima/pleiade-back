@@ -10,7 +10,7 @@ router = APIRouter()
 @router.post(   "/articles/search",
     response_model=ArticlesResponse,
     summary="Recherche d’articles Google Scholar (Serper)",
-    description="Pour chaque mot-clé, récupère les articles les plus cités sur la fenêtre [année-3, année-1].",)
+    description="Pour chaque mot-clé, récupère les articles les plus cités sur la fenêtre [année-3, année].",)
 def search_articles(body: ArticlesRequest, _: bool = Depends(ensure_serper)):
     try:
         raw_list: List[dict] = search_articles_serper(

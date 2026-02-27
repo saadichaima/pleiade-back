@@ -29,7 +29,7 @@ def search_articles_serper(
     """
     Interroge Google Scholar via Serper pour chaque mot-clé
     et retourne pour chacun les 'max_per_kw' articles les plus cités
-    restreints sur [annee-3, annee-1] si l'année est détectable.
+    restreints sur [annee-3, annee] si l'année est détectable.
 
     Retour (liste d'articles) — champs normalisés:
       - title, url, citations, authors, year, journal, keyword, selected
@@ -41,7 +41,7 @@ def search_articles_serper(
     headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
 
     start_year = annee_reference - 3
-    end_year   = annee_reference - 1
+    end_year   = annee_reference
 
     results: List[Dict[str, Any]] = []
 
@@ -180,13 +180,14 @@ def search_competitors_from_serper(
     url = "https://google.serper.dev/search"
     headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
 
-    # 2 requêtes complémentaires pour couvrir large
+    # Requêtes variées pour couvrir large (FR + EN, par type de produit)
     queries = [
-        f"{projet} concurrents alternatives solutions",
-        f"{societe} {projet} competitors marché",
+        f"{projet} logiciel plateforme concurrent",
+        f"{projet} software alternative SaaS",
     ]
     if secteur_keywords:
-        queries.append(f"{secteur_keywords} solutions logiciels entreprises")
+        queries.append(f"{secteur_keywords} logiciel plateforme entreprise")
+        queries.append(f"{secteur_keywords} software tool platform")
 
     seen_domains: set = set()
     results: List[Dict[str, str]] = []
@@ -217,11 +218,14 @@ def search_competitors_from_serper(
             if domain == client_domain:
                 continue
 
-            # Ignorer les sites généralistes (wikipedia, linkedin, comparateurs génériques)
+            # Ignorer les sites généralistes et les non-produits (formations, guides, admin)
             skip_domains = {
                 "wikipedia.org", "linkedin.com", "facebook.com", "twitter.com",
                 "youtube.com", "reddit.com", "quora.com", "medium.com",
                 "amazon.com", "amazon.fr",
+                "cnam.fr", "openclassrooms.com", "coursera.org", "udemy.com",
+                "gouvernement.fr", "bpifrance.fr", "impots.gouv.fr",
+                "documentaction.fr", "journaldunet.com", "legalstart.fr",
             }
             if any(sd in domain for sd in skip_domains):
                 continue

@@ -25,23 +25,26 @@ except Exception:
 def _iter_all_paragraphs_doc(doc: Document):
     """
     Retourne tous les Paragraph du document, y compris ceux des tableaux,
-    en-têtes et pieds de page.
+    des SDT (Structured Document Tags), en-têtes et pieds de page.
+
+    Utilise body.iter(qn('w:p')) pour couvrir les paragraphes imbriqués
+    dans des SDT (ex : template CII dont tout le corps est dans un SDT).
     """
-    def iter_container(container):
-        for p in getattr(container, "paragraphs", []):
-            yield p
-        for table in getattr(container, "tables", []):
-            for row in table.rows:
-                for cell in row.cells:
-                    yield from iter_container(cell)
+    # Corps principal : tous les <w:p> de l'arbre, y compris SDT et tableaux
+    body = doc.element.body
+    for p_elem in body.iter(qn("w:p")):
+        yield Paragraph(p_elem, doc)
 
-    # Corps principal
-    yield from iter_container(doc)
-
-    # Headers / footers
+    # Headers / footers (pas d'SDT typiquement, on garde l'approche standard)
     for section in doc.sections:
-        yield from iter_container(section.header)
-        yield from iter_container(section.footer)
+        for container in (section.header, section.footer):
+            for p in getattr(container, "paragraphs", []):
+                yield p
+            for table in getattr(container, "tables", []):
+                for row in table.rows:
+                    for cell in row.cells:
+                        for p in cell.paragraphs:
+                            yield p
 
 FIG_PATTERN = re.compile(r"(?i)\b(?:cf\.\s*)?(?:fig(?:\.|ure)?|image)\s*[:\-–]?\s*(\d+)\b")
 

@@ -19,8 +19,8 @@ class Settings(BaseModel):
     SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "")
 
     # Docs templates
-    TEMPLATE_CIR: str = os.getenv("TEMPLATE_CIR", "./Doc/MEMOIRE_CIR2.docx")
-    TEMPLATE_CII: str = os.getenv("TEMPLATE_CII", "./Doc/MEMOIRE_CII.docx")
+    TEMPLATE_CIR: str = os.getenv("TEMPLATE_CIR", "./Doc/MEMOIRE_CIR_XX.docx")
+    TEMPLATE_CII: str = os.getenv("TEMPLATE_CII", "./Doc/MEMOIRE_CII_XX.docx")
 
     # Misc
     DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"

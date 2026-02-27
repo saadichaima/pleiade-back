@@ -1,8 +1,16 @@
 # app/services/builder.py
+import re
 from typing import Tuple
 from Core import document, embeddings, rag
 from sklearn.neighbors import NearestNeighbors
 import numpy as np
+
+_ROUGE_TAG_RE = re.compile(r"\[\[ROUGE:.*?\]\]", re.DOTALL)
+
+
+def _strip_rouge_tags(text: str) -> str:
+    """Supprime les tags [[ROUGE: ...]] pour éviter la cascade dans les prompts suivants."""
+    return _ROUGE_TAG_RE.sub("", text).strip()
 
 RagPack = Tuple[object, list, list]
 
@@ -67,27 +75,34 @@ def build_sections_cir(
         )
     print(f"[CIR-BUILD] 1/12 objectif_unique OK en {time.time() - step_start:.1f}s")
 
-    # 2) VERROU UNIQUE (canonique)
+    # Nettoyer les tags [[ROUGE:...]] de l'objectif pour le verrou et les sections suivantes
+    obj_clean = _strip_rouge_tags(objectif_unique)
+
+    # 2) VERROU UNIQUE (canonique) - utilise l'objectif nettoyé
     print("[CIR-BUILD] 2/12 Generation verrou_unique...")
     step_start = time.time()
     verrou_unique = (verrou or "").strip()
     if not verrou_unique:
         verrou_unique = rag.generate_verrou_unique(
             idx_base, chunks_base, vecs_base,
-            objectif_unique=objectif_unique,
+            objectif_unique=obj_clean,
             annee=annee,
             societe=societe,
             articles=articles,
         )
     print(f"[CIR-BUILD] 2/12 verrou_unique OK en {time.time() - step_start:.1f}s")
 
+    # Nettoyer les tags [[ROUGE:...]] du verrou aussi
+    # Les versions originales (avec ROUGE) restent dans le dict final pour le template
+    ver_clean = _strip_rouge_tags(verrou_unique)
+
     # 3) OBJET (section détaillée) – ancrée par objectif_unique/verrou_unique
     print("[CIR-BUILD] 3/12 Generation section objet...")
     step_start = time.time()
     objet = rag.generate_objectifs_section(
         idx_obj, chunks_obj, vecs_obj,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
         articles=articles,
@@ -99,21 +114,21 @@ def build_sections_cir(
     step_start = time.time()
     section_verrou = rag.generate_verrou_section(
         idx_obj, chunks_obj, vecs_obj,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
         articles=articles,
     )
     print(f"[CIR-BUILD] 4/12 verrou OK en {time.time() - step_start:.1f}s")
 
-    # 5) Les autres sections utilisent exactement objectif_unique + verrou_unique
+    # 5) Les autres sections utilisent les versions nettoyées (sans tags ROUGE)
     print("[CIR-BUILD] 5/12 Generation section contexte...")
     step_start = time.time()
     contexte = rag.generate_contexte_section(
         idx_obj, chunks_obj, vecs_obj,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
         articles=articles,
@@ -124,8 +139,8 @@ def build_sections_cir(
     step_start = time.time()
     indicateurs = rag.generate_indicateurs_section(
         index_mix, chunks_mix, vectors_mix,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
     )
@@ -135,22 +150,23 @@ def build_sections_cir(
     step_start = time.time()
     travaux = rag.generate_travaux_section(
         index_client, chunks_client, vectors_client,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
     )
     if not doc_complete:
         print("[CIR-BUILD] 7/12 Evaluation travaux (doc incomplete)...")
         travaux = rag.evaluateur_travaux(travaux)
+        travaux = rag.wrap_questions_rouge(travaux)
     print(f"[CIR-BUILD] 7/12 travaux OK en {time.time() - step_start:.1f}s")
 
     print("[CIR-BUILD] 8/12 Generation section contribution...")
     step_start = time.time()
     contribution = rag.generate_contribution_section(
         index_client, chunks_client, vectors_client,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
     )
@@ -165,8 +181,8 @@ def build_sections_cir(
     step_start = time.time()
     partenariat = "Rien à déclarer." if not externalises else rag.generate_partenariat_section(
         index_mix, chunks_mix, vectors_mix,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
     )
@@ -181,8 +197,8 @@ def build_sections_cir(
     step_start = time.time()
     entreprise = rag.generate_entreprise_section(
         ent_index, ent_chunks, ent_vecs,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
         style=None,
@@ -194,8 +210,8 @@ def build_sections_cir(
     step_start = time.time()
     gestion = rag.generate_gestion_recherche_section(
         index_mix, chunks_mix, vectors_mix,
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
     )
@@ -216,8 +232,8 @@ def build_sections_cir(
             "partenariat": partenariat,
             "gestion": gestion,
         },
-        objectif_unique=objectif_unique,
-        verrou_unique=verrou_unique,
+        objectif_unique=obj_clean,
+        verrou_unique=ver_clean,
         annee=annee,
         societe=societe,
         articles=articles,
