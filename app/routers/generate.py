@@ -17,6 +17,8 @@ from fastapi.responses import StreamingResponse
 
 from app.auth_ms import get_current_user, get_current_user_with_query_token
 from app.config import settings
+from pydantic import ValidationError
+
 from app.models.auth import AppUser
 from app.models.schemas import GenerateRequest
 
@@ -509,7 +511,10 @@ async def start_generate_job(
     articles_pdfs: List[UploadFile] = File([]),
     current_user: AppUser = Depends(get_current_user),
 ):
-    req: GenerateRequest = GenerateRequest.model_validate_json(payload)
+    try:
+        req: GenerateRequest = GenerateRequest.model_validate_json(payload)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
     user_email = current_user.email
 
     # Nettoyer les vieux jobs pour libérer de la mémoire

@@ -27,7 +27,14 @@ def extract_text_from_bytes(data: bytes, filename: str = "") -> str:
         if not data:
             return ""
         d = DocxDocument(BytesIO(data))
-        return "\n".join(p.text for p in d.paragraphs)
+        # Iterate all <w:p> elements in the XML (captures paragraphs, tables, SDTs, text boxes…)
+        W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        lines = []
+        for p_elem in d.element.iter(f"{{{W}}}p"):
+            para_text = "".join(t.text or "" for t in p_elem.iter(f"{{{W}}}t"))
+            if para_text.strip():
+                lines.append(para_text)
+        return "\n".join(lines)
 
     # TXT
     if name.endswith(".txt"):
