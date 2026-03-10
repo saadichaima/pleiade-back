@@ -72,6 +72,8 @@ class Article(BaseModel):
     citations: Optional[int] = 0
     selected: bool = True
     iso_citation: Optional[str] = ""
+    pdf_url: Optional[str] = ""     # lien PDF direct (Serper pdfUrl) — téléchargé et indexé dans le RAG
+    snippet: Optional[str] = ""     # extrait abstract (Serper snippet) — injecté dans {liste_articles}
 
 
 class Competitor(BaseModel):

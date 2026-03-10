@@ -247,6 +247,52 @@ def _download_blob_content(blob_url: str) -> Optional[bytes]:
         return None
 
 
+def _archive_uploaded_files(
+    project_id: str,
+    docs_client_data: List[dict],
+    docs_admin_data: List[dict],
+    cvs_data: List[dict],
+    logo_data: Optional[dict],
+    articles_pdfs_data: List[dict],
+) -> None:
+    """
+    Archive tous les fichiers uploadés par l'utilisateur dans le container blob 'uploads'.
+    Structure : {project_id}/uploads/{category}/{filename}
+    Les erreurs sont loggées mais ne font pas échouer le job.
+    """
+    categories = [
+        ("docs_client", docs_client_data),
+        ("docs_admin", docs_admin_data),
+        ("cvs", cvs_data),
+        ("articles", articles_pdfs_data),
+    ]
+    for category, files in categories:
+        for f in files:
+            try:
+                blob_name = f"{project_id}/uploads/{category}/{f['filename']}"
+                upload_bytes_to_blob(
+                    container_name=settings.STORAGE_CONTAINER_UPLOADS,
+                    blob_name=blob_name,
+                    data=f["data"],
+                    content_type=f.get("content_type") or "application/octet-stream",
+                )
+                print(f"[ARCHIVE] OK {category}/{f['filename']}")
+            except Exception as e:
+                print(f"[ARCHIVE] WARN échec upload {category}/{f['filename']}: {e}")
+    if logo_data:
+        try:
+            blob_name = f"{project_id}/uploads/logo/{logo_data['filename']}"
+            upload_bytes_to_blob(
+                container_name=settings.STORAGE_CONTAINER_UPLOADS,
+                blob_name=blob_name,
+                data=logo_data["data"],
+                content_type=logo_data.get("content_type") or "image/png",
+            )
+            print(f"[ARCHIVE] OK logo/{logo_data['filename']}")
+        except Exception as e:
+            print(f"[ARCHIVE] WARN échec upload logo: {e}")
+
+
 def _persist_generation(
     *,
     project_id: str,
@@ -385,6 +431,42 @@ def _generate_docx_sync(
             txt = document.extract_text_from_bytes(d["data"], d.get("filename", "") or "")
             text_articles += "\n" + txt
             articles_texts.append(txt)
+
+        # Indexer le contenu des articles Serper sélectionnés dans le RAG.
+        # Priorité 1 : pdfUrl direct (déjà testé comme PDF valide)
+        # Priorité 2 : fallback article_fetcher (patterns PDF + scraping HTML + abstract)
+        import requests as _requests
+        from Core.article_fetcher import fetch_article_content as _fetch_article
+        for article in req.articles:
+            if not article.selected:
+                continue
+            pdf_url = (article.pdf_url or "").strip()
+            html_url = (article.url or "").strip()
+            txt = ""
+
+            # Priorité 1 — pdfUrl direct
+            if pdf_url:
+                try:
+                    resp_pdf = _requests.get(pdf_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                    if resp_pdf.status_code == 200 and resp_pdf.content[:4] == b"%PDF":
+                        txt = document.extract_text_from_bytes(resp_pdf.content, "article_serper.pdf")
+                        if txt.strip():
+                            print(f"[ARTICLES] Indexé via pdfUrl : {article.title[:60]} ({len(txt)} chars)")
+                        else:
+                            txt = ""
+                except Exception as _e:
+                    print(f"[ARTICLES] Échec pdfUrl ({pdf_url}): {_e}")
+
+            # Priorité 2 — fallback HTML (pattern PDF + scraping + abstract)
+            if not txt.strip() and html_url:
+                txt = _fetch_article(html_url)
+                if txt.strip():
+                    print(f"[ARTICLES] Indexé via HTML fallback : {article.title[:60]} ({len(txt)} chars)")
+
+            if txt.strip():
+                text_articles += "\n" + txt
+            else:
+                print(f"[ARTICLES] Aucun contenu récupérable pour : {article.title[:60]}")
 
         chunks_art = [c for c in document.chunk_text(text_articles) if c.strip()]
         if chunks_art:
@@ -548,6 +630,11 @@ async def start_generate_job(
     cvs_data = await _read_list(cvs)
     articles_pdfs_data = await _read_list(articles_pdfs)
     logo_bytes = (await logo.read()) if logo else None
+    logo_data = {
+        "filename": logo.filename or "logo",
+        "data": logo_bytes,
+        "content_type": logo.content_type or "image/png",
+    } if logo and logo_bytes else None
 
     async def _runner():
         try:
@@ -584,6 +671,20 @@ async def start_generate_job(
             )
 
             blob_url = persist_result["blob_url"]
+
+            # Archiver les fichiers uploadés dans le container 'uploads' (non bloquant si échec)
+            try:
+                await anyio.to_thread.run_sync(
+                    _archive_uploaded_files,
+                    project_id,
+                    docs_client_data,
+                    docs_admin_data,
+                    cvs_data,
+                    logo_data,
+                    articles_pdfs_data,
+                )
+            except Exception as e:
+                print(f"[ARCHIVE] WARN archivage uploads échoué (non bloquant): {e}")
 
             # Mettre à jour le job dans Cosmos avec le résultat
             _complete_job_in_cosmos(job_id, project_id, filename, blob_url)

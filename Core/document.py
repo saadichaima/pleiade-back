@@ -52,20 +52,94 @@ def extract_text_from_bytes(data: bytes, filename: str = "") -> str:
                     out.append(sh.text)
         return "\n".join(out)
 
-    # XLSX
+    # XLSX / XLS
     if name.endswith(".xlsx"):
-        if not data:
-            return ""
-        wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
-        lines = []
-        for sh in wb.worksheets:
-            for row in sh.iter_rows(values_only=True):
-                cells = [str(c) for c in row if c not in (None, "")]
-                if cells:
-                    lines.append(" ".join(cells))
-        return "\n".join(lines)
+        return _extract_xlsx_text(data)
+
+    if name.endswith(".xls"):
+        return _extract_xls_text(data)
 
     return ""
+
+
+def _extract_xlsx_text(data: bytes) -> str:
+    """
+    Extrait le texte d'un .xlsx avec contexte structurel :
+    - Nom de chaque feuille comme en-tête
+    - Première ligne utilisée comme en-têtes de colonnes
+    - Format : "Colonne: valeur | Colonne2: valeur2"
+    - data_only=True : lit les valeurs cachées (pas les formules brutes)
+      → si une cellule est None, la valeur n'était pas calculée/cachée dans le fichier
+    """
+    if not data:
+        return ""
+    wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
+    sections = []
+    for sh in wb.worksheets:
+        rows = list(sh.iter_rows(values_only=True))
+        if not rows:
+            continue
+        # Première ligne = en-têtes de colonnes
+        headers = [
+            str(c).strip() if c not in (None, "") else f"Col{i + 1}"
+            for i, c in enumerate(rows[0])
+        ]
+        section_lines = [f"=== Feuille: {sh.title} ==="]
+        for row in rows[1:]:
+            pairs = []
+            for header, cell in zip(headers, row):
+                if cell not in (None, ""):
+                    val = str(cell).strip()
+                    if val:
+                        pairs.append(f"{header}: {val}")
+            if pairs:
+                section_lines.append(" | ".join(pairs))
+        if len(section_lines) > 1:
+            sections.append("\n".join(section_lines))
+    return "\n\n".join(sections)
+
+
+def _extract_xls_text(data: bytes) -> str:
+    """
+    Extrait le texte d'un .xls (ancien format Excel) via xlrd.
+    Même structure que _extract_xlsx_text.
+    """
+    if not data:
+        return ""
+    try:
+        import xlrd
+    except ImportError:
+        return ""
+    wb = xlrd.open_workbook(file_contents=data)
+    sections = []
+    for sh in wb.sheets():
+        if sh.nrows == 0:
+            continue
+        # Première ligne = en-têtes
+        headers = [
+            str(sh.cell_value(0, c)).strip() or f"Col{c + 1}"
+            for c in range(sh.ncols)
+        ]
+        section_lines = [f"=== Feuille: {sh.name} ==="]
+        for r in range(1, sh.nrows):
+            pairs = []
+            for c in range(sh.ncols):
+                cell_type = sh.cell_type(r, c)
+                if cell_type == xlrd.XL_CELL_EMPTY:
+                    continue
+                val = sh.cell_value(r, c)
+                # Afficher les entiers sans .0
+                if cell_type == xlrd.XL_CELL_NUMBER and val == int(val):
+                    str_val = str(int(val))
+                else:
+                    str_val = str(val).strip()
+                if str_val:
+                    pairs.append(f"{headers[c]}: {str_val}")
+            if pairs:
+                section_lines.append(" | ".join(pairs))
+        if len(section_lines) > 1:
+            sections.append("\n".join(section_lines))
+    return "\n\n".join(sections)
 
 def extract_text(file) -> str:
     """Compat rétro: lit le flux entier et appelle extract_text_from_bytes."""

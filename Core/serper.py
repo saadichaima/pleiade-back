@@ -92,6 +92,8 @@ def search_articles_serper(
                 "journal": source or "",
                 "keyword": kw,
                 "selected": True,
+                "pdf_url": (item.get("pdfUrl") or "").strip(),
+                "snippet": (item.get("snippet") or "").strip(),
             })
 
         # Trier par citations et prendre top N

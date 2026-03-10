@@ -3,7 +3,7 @@ from typing import List, Dict, Any
 import json
 import re
 from app.services.prompts import fetch_cii, prompt_evaluateur_travaux
-from Core.rag import generate_section_with_rag, _build, call_ai
+from Core.rag import generate_section_with_rag, search_chunks_by_score, _build, call_ai
 
 
 def _tmpl_cii(key: str) -> str:
@@ -413,44 +413,101 @@ def gen_performances(
 
 
 def gen_demarche_annee(
-    i,
+    _i,
     c,
     v,
     *,
     annee,
     performance_type: str = "",
 ) -> str:
+    # Multi-query + score-based filtering : couvre tous les angles de la démarche expérimentale.
+    queries = [
+        f"démarche expérimentale {annee}",
+        f"hypothèses testées et expérimentations {annee}",
+        f"résultats obtenus et observations {annee}",
+        f"méthodes et protocoles de test {annee}",
+        f"difficultés rencontrées {annee}",
+        f"travaux {annee}",
+        performance_type[:120] if performance_type else "démarche innovation",
+    ]
+    seen: set = set()
+    ctx_chunks: List[str] = []
+    for q in queries:
+        for chunk, _ in search_chunks_by_score(
+            q, c, v,
+            min_score=0.45, top_k_min=2, top_k_max=5,
+        ):
+            h = hash(chunk)
+            if h not in seen:
+                seen.add(h)
+                ctx_chunks.append(chunk)
+    print(f"[RAG-CII] demarche {annee} → {len(ctx_chunks)} chunks uniques (multi-query + score≥0.45)")
+    ctx = "\n\n---\n\n".join(ctx_chunks)
     instr = _build(
         _tmpl_cii("demarche"),
         annee=annee,
         performance_type=performance_type,
     )
-    raw=generate_section_with_rag(
-        f"Démarche expérimentale {annee}",
-        instr,
-        i, c, v,
-    )
+    prompt = f"""Rédige la section "Démarche expérimentale {annee}" de manière détaillée et approfondie.
+
+Contexte documentaire :
+\"\"\"{ctx}\"\"\"
+
+Consignes spécifiques (à suivre impérativement) :
+{instr}
+
+IMPORTANT : Développe chaque point en profondeur. Fournis des explications techniques précises, des exemples concrets issus du contexte, et des analyses détaillées. Ne résume pas, développe.
+"""
+    raw = call_ai(prompt, meta=f"demarche_cii_{annee}", temperature=0.2)
     return _normalize_md_lists(raw)
 
 
 def gen_resultats_annee(
-    i,
+    _i,
     c,
     v,
     *,
     annee,
     performance_type: str = "",
 ) -> str:
+    # Multi-query + score-based filtering : couvre tous les angles des résultats.
+    queries = [
+        f"résultats obtenus {annee}",
+        "mesures performances et observations",
+        "comparaison objectifs et résultats",
+        "supériorité et avantages obtenus",
+        f"bilan {annee}",
+        performance_type[:120] if performance_type else "résultats innovation",
+    ]
+    seen: set = set()
+    ctx_chunks: List[str] = []
+    for q in queries:
+        for chunk, _ in search_chunks_by_score(
+            q, c, v,
+            min_score=0.45, top_k_min=2, top_k_max=5,
+        ):
+            h = hash(chunk)
+            if h not in seen:
+                seen.add(h)
+                ctx_chunks.append(chunk)
+    print(f"[RAG-CII] resultats {annee} → {len(ctx_chunks)} chunks uniques (multi-query + score≥0.45)")
+    ctx = "\n\n---\n\n".join(ctx_chunks)
     instr = _build(
         _tmpl_cii("resultats"),
         annee=annee,
         performance_type=performance_type,
     )
-    raw= generate_section_with_rag(
-        f"Résultats & supériorité {annee}",
-        instr,
-        i, c, v,
-    )
+    prompt = f"""Rédige la section "Résultats & supériorité {annee}" de manière détaillée et approfondie.
+
+Contexte documentaire :
+\"\"\"{ctx}\"\"\"
+
+Consignes spécifiques (à suivre impérativement) :
+{instr}
+
+IMPORTANT : Développe chaque point en profondeur. Fournis des explications techniques précises, des exemples concrets issus du contexte, et des analyses détaillées. Ne résume pas, développe.
+"""
+    raw = call_ai(prompt, meta=f"resultats_cii_{annee}", temperature=0.2)
     return _normalize_md_lists(raw)
 
 

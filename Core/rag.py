@@ -32,7 +32,7 @@ def _extract_usage(resp):
 
 _SYSTEM_PROMPT = (
     "Tu es un expert en rédaction scientifique et technique. Tu rédiges des sections détaillées, "
-    "développées et approfondies pour des dossiers de recherche (CIR/CII). Tes réponses doivent être "
+    "développées et approfondies pour des dossiers de recherche ou d'innovation. Tes réponses doivent être "
     "complètes et exhaustives. Respecte précisément les consignes de longueur et de format données dans le prompt."
 )
 
@@ -114,6 +114,38 @@ def search_similar_chunks(query: str, index, chunks: List[str], vectors, top_k: 
     d, idx = index.kneighbors(q, n_neighbors=actual_k)
     return [chunks[i] for i in idx[0]]
 
+def search_chunks_by_score(
+    query: str,
+    chunks: List[str],
+    vectors,
+    min_score: float = 0.45,
+    top_k_min: int = 3,
+    top_k_max: int = 20,
+) -> List[tuple]:
+    """
+    Retourne les chunks dont la similarité cosinus >= min_score avec la requête.
+    Garantit au moins top_k_min chunks (même sous le seuil) et plafonne à top_k_max.
+    Retourne une liste de (chunk, score) triée par score décroissant.
+    """
+    if not chunks or not vectors or len(vectors) == 0:
+        return []
+    q_emb = embed_texts([query])
+    if not q_emb:
+        return []
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+    q_vec = np.array(q_emb[0], dtype=np.float32).reshape(1, -1)
+    vecs_matrix = np.array(vectors, dtype=np.float32)
+    scores = cosine_similarity(q_vec, vecs_matrix)[0]
+    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    ranked = ranked[:top_k_max]
+    result = []
+    for i, (idx, score) in enumerate(ranked):
+        if float(score) >= min_score or i < top_k_min:
+            result.append((chunks[idx], float(score)))
+    print(f"[RAG-SCORE] '{query[:60]}' → {len(result)} chunks (seuil={min_score})")
+    return result
+
 def _build(template: str, **kw) -> str:
     class _Safe(dict):
         def __missing__(self, k): return ""
@@ -132,11 +164,15 @@ def _articles_list_str(articles: Optional[List[dict]]) -> str:
         title = (a.get("title") or "").strip()
         journal = (a.get("journal") or "").strip()
         url = (a.get("url") or "").strip()
+        snippet = (a.get("snippet") or "").strip()
         s = f"- {authors} ({year}). {title}" if title else f"- {authors} ({year})."
         if journal:
             s += f" — {journal}"
         if url:
             s += f" — {url}"
+        # Injecter le snippet Serper pour ancrer les citations sur un vrai extrait
+        if snippet:
+            s += f"\n  Extrait : « {snippet[:300]} »"
         lines.append(s)
     return "\n".join(lines) if lines else "- Aucune référence sélectionnée."
 
@@ -165,8 +201,30 @@ def _tmpl(name: str) -> str:
     print(f"[PROMPT CIR] {name} ({filename}) -> {len(content)} chars | debut: {content[:150]}...")
     return content
 
-def generate_section_with_rag(title: str, instruction: str, index, chunks, vectors, *, top_k: int = 5, temperature: float = 0.2) -> str:
-    ctx = "\n".join(search_similar_chunks(title or "section", index, chunks, vectors, top_k=top_k)) if index else ""
+def generate_section_with_rag(
+    title: str,
+    instruction: str,
+    index,
+    chunks,
+    vectors,
+    *,
+    top_k: int = 5,
+    min_score: float = 0.0,
+    temperature: float = 0.2,
+) -> str:
+    """
+    Génère une section avec contexte RAG.
+    - Si min_score > 0 : score-based filtering (cosinus) avec top_k_max=top_k et seuil min_score.
+    - Sinon : KNN classique top_k (comportement historique).
+    """
+    if min_score > 0.0 and vectors is not None and len(vectors) > 0:
+        scored = search_chunks_by_score(
+            title or "section", chunks, vectors,
+            min_score=min_score, top_k_min=3, top_k_max=top_k,
+        )
+        ctx = "\n\n---\n\n".join(c for c, _ in scored)
+    else:
+        ctx = "\n".join(search_similar_chunks(title or "section", index, chunks, vectors, top_k=top_k)) if index else ""
     prompt = f"""Rédige la section "{title}" de manière détaillée et approfondie.
 
 Contexte documentaire :
@@ -302,21 +360,50 @@ def generate_indicateurs_section(index, chunks, vectors, *, objectif_unique: str
         temperature=0.2,
     )
 
-def generate_travaux_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str) -> str:
-    return generate_section_with_rag(
-        "Description de la démarche suivie et des travaux réalisés",
-        _build(
-            _tmpl("travaux"),
-            objectif_unique=objectif_unique,
-            verrou_unique=verrou_unique,
-            objectif=objectif_unique,
-            verrou=verrou_unique,
-            annee=annee,
-            societe=societe,
-        ),
-        index, chunks, vectors,
-        temperature=0.2,
+def generate_travaux_section(_index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str) -> str:
+    # Multi-query : couvre tous les angles de la section travaux
+    # puis score-based filtering (cosinus >= 0.45) pour ne garder que les chunks pertinents.
+    queries = [
+        f"démarche scientifique et travaux réalisés {annee}",
+        f"hypothèses testées et expérimentations {annee}",
+        f"résultats obtenus et observations {annee}",
+        f"méthodes et protocoles expérimentaux {annee}",
+        f"difficultés rencontrées {annee}",
+        f"travaux {annee}",
+        objectif_unique[:120],
+    ]
+    seen: set = set()
+    ctx_chunks: List[str] = []
+    for q in queries:
+        for chunk, score in search_chunks_by_score(
+            q, chunks, vectors,
+            min_score=0.45, top_k_min=2, top_k_max=5,
+        ):
+            h = hash(chunk)
+            if h not in seen:
+                seen.add(h)
+                ctx_chunks.append(chunk)
+    print(f"[RAG] travaux → {len(ctx_chunks)} chunks uniques (multi-query + score≥0.45)")
+    ctx = "\n\n---\n\n".join(ctx_chunks)
+    instruction = _build(
+        _tmpl("travaux"),
+        objectif_unique=objectif_unique,
+        verrou_unique=verrou_unique,
+        objectif=objectif_unique,
+        verrou=verrou_unique,
+        annee=annee,
+        societe=societe,
     )
+    prompt = f"""Rédige la section "Description de la démarche suivie et des travaux réalisés" de manière détaillée et approfondie.
+
+Contexte documentaire :
+\"\"\"{ctx}\"\"\"
+
+Consignes spécifiques (à suivre impérativement) :
+{instruction}
+
+"""
+    return call_ai(prompt, meta="travaux", temperature=0.2)
 
 def generate_contribution_section(index, chunks, vectors, *, objectif_unique: str, verrou_unique: str, annee: int, societe: str) -> str:
     return generate_section_with_rag(
