@@ -142,6 +142,7 @@ def _semantic_filter_images(images_meta: List[Dict], *, target_keep: int = 10) -
     negative_keywords = [
         "photo contexte", "personne", "personnes", "réunion", "meeting",
         "bâtiment", "ville", "paysage", "portrait", "selfie",
+        "logo",
     ]
 
     def score(caption: str) -> int:
@@ -373,6 +374,7 @@ def _prepare_figures_for_dossier(
 
     # index par id local (1..n sur la sélection filtrée)
     id_map = {m["id"]: m for m in images_meta}
+    seen_img_ids: set = set()
 
     for item in mapping_sorted:
         try:
@@ -382,9 +384,13 @@ def _prepare_figures_for_dossier(
             continue
         if fig_num < 1:
             continue
+        if img_id in seen_img_ids:
+            print(f"[figures_planner] image_id={img_id} déjà sélectionnée → ignorée (doublon).")
+            continue
         meta = id_map.get(img_id)
         if not meta:
             continue
+        seen_img_ids.add(img_id)
         ordered_images.append((meta["bytes"], meta["ext"]))
 
         legend = (item.get("legend") or "").strip()
