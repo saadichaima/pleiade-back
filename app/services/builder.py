@@ -157,7 +157,7 @@ def build_sections_cir(
     )
     if not doc_complete:
         print("[CIR-BUILD] 7/12 Evaluation travaux (doc incomplete)...")
-        travaux = rag.evaluateur_travaux(travaux)
+        travaux = rag.evaluateur_travaux(travaux, chunks_client, vectors_client)
         travaux = rag.wrap_questions_rouge(travaux)
     print(f"[CIR-BUILD] 7/12 travaux OK en {time.time() - step_start:.1f}s")
 
@@ -206,17 +206,6 @@ def build_sections_cir(
     )
     print(f"[CIR-BUILD] 11/12 entreprise OK en {time.time() - step_start:.1f}s")
 
-    print("[CIR-BUILD] 12/12 Generation section gestion...")
-    step_start = time.time()
-    gestion = rag.generate_gestion_recherche_section(
-        index_mix, chunks_mix, vectors_mix,
-        objectif_unique=obj_clean,
-        verrou_unique=ver_clean,
-        annee=annee,
-        societe=societe,
-    )
-    print(f"[CIR-BUILD] 12/12 gestion OK en {time.time() - step_start:.1f}s")
-
     # Générer le résumé en se basant sur les sections déjà générées
     print("[CIR-BUILD] FINAL Generation resume...")
     step_start = time.time()
@@ -230,7 +219,6 @@ def build_sections_cir(
             "contribution": contribution,
             "indicateurs": indicateurs,
             "partenariat": partenariat,
-            "gestion": gestion,
         },
         objectif_unique=obj_clean,
         verrou_unique=ver_clean,
@@ -258,7 +246,6 @@ def build_sections_cir(
         "biblio": biblio,
         "partenariat": partenariat,
         "entreprise": entreprise,
-        "gestion": gestion,
         "resume": resume,
     }
 

@@ -609,26 +609,55 @@ def get_biblio_intro() -> str:
     Intro générique de la partie bibliographie CII (si tu en as une).
     """
     return _tmpl_cii("biblio_intro") or ""
-def evaluateur_travaux(texte: str, *, type_dossier: str = "CII") -> str:
+# Éléments obligatoires d’un dossier CII — on vérifie leur présence dans les docs client
+_CRITERES_REQUIS_CII = [
+    ("Fonctionnalités utilisateur du module (parcours, actions, filtres, notifications)",
+     "fonctionnalité utilisateur interface parcours action filtre notification écran"),
+    ("Spécificités techniques (architecture, APIs, algorithmes, données)",
+     "architecture technique API algorithme données infrastructure base de données"),
+    ("Tests réalisés et résultats chiffrés (validation, performance mesurée)",
+     "test résultat chiffre performance mesure validation benchmark"),
+    ("Difficultés rencontrées et solutions apportées",
+     "difficulté problème obstacle blocage erreur bug solution contournement"),
+    ("Résultat ou amélioration finale atteinte",
+     "amélioration résultat gain performance atteint objectif livraison"),
+]
+
+def _detect_lacunes_cii(chunks: list, vectors: list) -> list:
+    """
+    Pour chaque élément obligatoire CII, interroge le RAG sur les documents client.
+    Retourne uniquement les éléments ABSENTS des documents (= lacunes réelles).
+    """
+    from Core.rag import search_chunks_by_score
+    lacunes = []
+    for label, query in _CRITERES_REQUIS_CII:
+        results = search_chunks_by_score(query, chunks, vectors, min_score=0.38, top_k_min=0, top_k_max=3)
+        if not results:
+            lacunes.append(label)
+            print(f"[LACUNE-CII] absent des docs : {label[:60]}")
+        else:
+            print(f"[LACUNE-CII] présent (score={results[0][1]:.2f}) : {label[:60]}")
+    return lacunes
+
+def evaluateur_travaux(texte: str, chunks: list, vectors: list, *, type_dossier: str = "CII") -> str:
     """
     Insère des questions encadrées [[ROUGE: ...]] dans la section Travaux (CII),
-    sans altérer le texte d’origine (sauf insertion des questions).
-
-    Le prompt est partagé avec la version CIR et est chargé depuis le Blob
-    (evaluateur_travaux.txt dans PROMPTS_CONTAINER_OTHERS).
+    uniquement pour les éléments absents des documents client (détection via RAG).
     """
     libelle = (
         "Description détaillée de la démarche expérimentale suivie et des travaux réalisés"
         if type_dossier == "CII"
         else "Description détaillée de la démarche scientifique suivie et des travaux réalisés"
     )
-
+    lacunes = _detect_lacunes_cii(chunks, vectors)
+    lacunes_txt = "\n".join(f"- {l}" for l in lacunes) if lacunes else "Aucune lacune détectée."
     tpl = prompt_evaluateur_travaux()
     try:
         prompt = tpl.format(
             type_dossier=type_dossier,
             libelle=libelle,
             texte=texte,
+            lacunes=lacunes_txt,
         )
     except Exception as e:
         raise RuntimeError(f"Erreur formatage prompt evaluateur_travaux (CII): {e}")

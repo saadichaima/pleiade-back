@@ -111,7 +111,7 @@ def generate_docx(
     auto_annotate_docx_with_footnotes(
         output_path,
         use_llm_terms=True,
-        max_terms=15,
+        max_terms=25,
         add_url_footnotes=True,
     )
 

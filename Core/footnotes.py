@@ -57,7 +57,7 @@ def extract_text_from_docx(docx_path: str) -> str:
 # =======================
 # Terme -> définition via LLM
 # =======================
-def extract_terms_with_llm(text: str, max_terms: int = 15) -> OrderedDict:
+def extract_terms_with_llm(text: str, max_terms: int = 25) -> OrderedDict:
     """
     Utilise rag.call_ai pour obtenir un JSON de la forme :
     {"items": [{"term":"…", "definition":"…"}, ...]}

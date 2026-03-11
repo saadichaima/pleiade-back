@@ -468,10 +468,12 @@ def summarise_with_azure(
             consigne=consigne,
             start_index=start_idx,
         )
+        # Proportionner les tokens au nombre d'images dans le lot (min 400/image)
+        tokens_for_group = max(max_output_tokens, 400 * len(group))
         text = _call_azure_vision_with_fallback(
             parts,
             primary_deployment=deployment,
-            max_output_tokens=max_output_tokens,
+            max_output_tokens=tokens_for_group,
             temperature=temperature,
         )
         results.append(text)

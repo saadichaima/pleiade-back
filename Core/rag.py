@@ -770,18 +770,52 @@ def generate_ressources_humaines_from_cvs(cv_texts: List[str], max_cvs: int = 10
     print(f"[RH] Total: {len(unique_personnel)} personne(s) extraite(s) (après dédoublonnage)")
     return unique_personnel
 
-def evaluateur_travaux(texte: str, *, type_dossier: str = "CIR") -> str:
+# Éléments obligatoires d'un dossier CIR — on vérifie leur présence dans les docs client
+_CRITERES_REQUIS_CIR = [
+    ("Hypothèse de travail formulée et testée (non-évidence, créativité de l'approche)",
+     "hypothèse de travail supposition théorie idée initiale non évidente créativité"),
+    ("Démarche & chronologie des étapes (méthodes, protocole, critères d'arrêt, reproductibilité)",
+     "étapes développement chronologie méthode protocole déroulement itération"),
+    ("Expérimentations, prototypes et outils utilisés (versions, environnements, preuves)",
+     "prototype expérimentation outil version environnement test jeu de données"),
+    ("Difficultés rencontrées et solutions apportées",
+     "difficulté problème obstacle blocage erreur bug solution contournement"),
+    ("Résultats chiffrés et mesures (métriques, benchmarks, résultats partiels ou négatifs)",
+     "résultat chiffre mesure performance métrique benchmark observation interprétation"),
+    ("Bilan de l'année, acquis, reste à faire et lien avec l'année suivante",
+     "bilan acquis conclusion reste à faire suite prochaine étape perspective"),
+]
+
+def _detect_lacunes_cir(chunks: list, vectors: list) -> list:
+    """
+    Pour chaque élément obligatoire CIR, interroge le RAG sur les documents client.
+    Retourne uniquement les éléments ABSENTS des documents (= lacunes réelles).
+    """
+    lacunes = []
+    for label, query in _CRITERES_REQUIS_CIR:
+        results = search_chunks_by_score(query, chunks, vectors, min_score=0.38, top_k_min=0, top_k_max=3)
+        if not results:
+            lacunes.append(label)
+            print(f"[LACUNE-CIR] absent des docs : {label[:60]}")
+        else:
+            print(f"[LACUNE-CIR] présent (score={results[0][1]:.2f}) : {label[:60]}")
+    return lacunes
+
+def evaluateur_travaux(texte: str, chunks: list, vectors: list, *, type_dossier: str = "CIR") -> str:
     libelle = (
         "Description détaillée de la démarche scientifique suivie et des travaux réalisés"
         if type_dossier == "CIR"
         else "Description détaillée de la démarche expérimentale suivie et des travaux réalisés"
     )
+    lacunes = _detect_lacunes_cir(chunks, vectors)
+    lacunes_txt = "\n".join(f"- {l}" for l in lacunes) if lacunes else "Aucune lacune détectée."
     tpl = prompt_evaluateur_travaux()
     try:
         prompt = tpl.format(
             type_dossier=type_dossier,
             libelle=libelle,
             texte=texte,
+            lacunes=lacunes_txt,
         )
     except Exception as e:
         raise RuntimeError(f"Erreur formatage prompt evaluateur_travaux (CIR): {e}")
