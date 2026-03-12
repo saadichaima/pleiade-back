@@ -153,6 +153,28 @@ def team_history(user: AppUser = Depends(require_manager)):
     return {"items": enriched}
 
 
+@router.get("/history/project/{project_id}")
+def get_project_payload(project_id: str, user: AppUser = Depends(get_current_user)):
+    """
+    Retourne le payload complet d'un projet pour pré-remplir le formulaire de génération.
+    L'utilisateur ne peut accéder qu'à ses propres projets (les admins peuvent accéder à tous).
+    """
+    projects_container = get_projects_container()
+    query = "SELECT * FROM c WHERE c.project_id = @pid"
+    items = list(projects_container.query_items(
+        query=query,
+        parameters=[{"name": "@pid", "value": project_id}],
+        enable_cross_partition_query=True,
+    ))
+    if not items:
+        raise HTTPException(status_code=404, detail="Projet introuvable.")
+    item = items[0]
+    # Vérification d'accès : seul le propriétaire ou un admin peut accéder
+    if item.get("user_id") != user.email and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Accès refusé.")
+    return {"payload": item.get("payload"), "created_at": item.get("created_at")}
+
+
 @router.get("/history/user/{user_email}")
 def user_history(user_email: str, _: AppUser = Depends(require_admin)):
     """
